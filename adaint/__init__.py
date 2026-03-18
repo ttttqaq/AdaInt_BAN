@@ -1,4 +1,6 @@
 from .model import AiLUT
+from .model_kd_unified import AiLUT_kd_unified
+from .loss import KD_Loss
 from .dataset import FiveK, PPR10K
 from .transforms import (
     RandomRatioCrop,
@@ -7,6 +9,6 @@ from .transforms import (
     FlipChannels)
 
 __all__ = [
-    'AiLUT', 'FiveK', 'PPR10K',
+    'AiLUT', 'AiLUT_kd_unified', 'FiveK', 'PPR10K', 'KD_Loss',
     'RandomRatioCrop', 'FlexibleRescaleToZeroOne',
     'RandomColorJitter', 'FlipChannels']

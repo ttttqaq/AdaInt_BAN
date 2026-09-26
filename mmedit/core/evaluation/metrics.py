@@ -306,6 +306,61 @@ def ssim(img1, img2, crop_border=0, input_order='HWC', convert_to=None):
     return np.array(ssims).mean()
 
 
+def delta_e(img1, img2, crop_border=0, input_order='HWC', method='cie76'):
+    """Calculate mean Delta E (color difference) in the CIELAB color space.
+
+    This is a common metric for photo retouching / color grading tasks,
+    measuring the perceptual color difference between the enhanced output
+    and the groundtruth, independent of PSNR (which is dominated by
+    luminance/structure differences).
+
+    Args:
+        img1 (ndarray): Images with range [0, 255], following this
+            codebase's convention (BGR order, see `tensor2img`).
+        img2 (ndarray): Images with range [0, 255].
+        crop_border (int): Cropped pixels in each edges of an image. These
+            pixels are not involved in the Delta E calculation. Default: 0.
+        input_order (str): Whether the input order is 'HWC' or 'CHW'.
+            Default: 'HWC'.
+        method (str): Either 'cie76' (Euclidean distance in CIELAB, a.k.a.
+            deltaE76, the classic and fastest definition) or 'ciede2000'
+            (CIEDE2000, perceptually more accurate but slower).
+            Default: 'cie76'.
+
+    Returns:
+        float: mean Delta E over all pixels.
+    """
+
+    assert img1.shape == img2.shape, (
+        f'Image shapes are different: {img1.shape}, {img2.shape}.')
+    if input_order not in ['HWC', 'CHW']:
+        raise ValueError(
+            f'Wrong input_order {input_order}. Supported input_orders are '
+            '"HWC" and "CHW"')
+    img1 = reorder_image(img1, input_order=input_order)
+    img2 = reorder_image(img2, input_order=input_order)
+
+    if crop_border != 0:
+        img1 = img1[crop_border:-crop_border, crop_border:-crop_border, :]
+        img2 = img2[crop_border:-crop_border, crop_border:-crop_border, :]
+
+    # this codebase stores images in BGR order (see `tensor2img`), while Lab
+    # conversion assumes RGB order.
+    from skimage.color import deltaE_cie76, deltaE_ciede2000, rgb2lab
+    lab1 = rgb2lab(img1[..., ::-1].astype(np.float64) / 255.)
+    lab2 = rgb2lab(img2[..., ::-1].astype(np.float64) / 255.)
+
+    if method == 'cie76':
+        de = deltaE_cie76(lab1, lab2)
+    elif method == 'ciede2000':
+        de = deltaE_ciede2000(lab1, lab2)
+    else:
+        raise ValueError(
+            f'Wrong method {method}. Supported methods are '
+            '"cie76" and "ciede2000"')
+    return de.mean()
+
+
 class L1Evaluation:
     """L1 evaluation metric.
 

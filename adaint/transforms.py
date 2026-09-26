@@ -1,5 +1,6 @@
 import random
 import numpy as np
+import mmcv
 from PIL import Image
 from torch.nn.modules.utils import _pair
 from torchvision.transforms import ColorJitter
@@ -47,6 +48,51 @@ class RandomRatioCrop(object):
             self.crop_ratio, self.isotropic, self.keys)
         
         
+@PIPELINES.register_module()
+class ResizeToMatch(object):
+    r"""Resize images to match the spatial size of a reference image.
+
+    This is needed when the LQ and GT images of a paired dataset are
+    provided at different resolutions (e.g. the raw camera input is kept
+    at full resolution while the retouched groundtruth is exported at a
+    lower resolution). Downstream paired transforms (e.g. `RandomRatioCrop`,
+    `Flip`) assume all `keys` share the same shape, so this transform must
+    be applied right after loading and before any such paired transform.
+
+    Args:
+        keys (Sequence[str]): The images to be resized (the reference key
+            itself is skipped if included).
+        reference_key (str): The key of the reference image whose spatial
+            size (h, w) the `keys` images will be resized to.
+        interpolation (str, optional): Interpolation method, passed to
+            `mmcv.imresize`. 'area' is recommended when downsampling (it
+            behaves like a box filter and avoids aliasing), 'bilinear' is
+            fine when upsampling. Default: 'bilinear'.
+    """
+
+    def __init__(self, keys, reference_key, interpolation='bilinear'):
+        self.keys = keys
+        self.reference_key = reference_key
+        self.interpolation = interpolation
+
+    def __call__(self, results):
+        ref_h, ref_w = results[self.reference_key].shape[:2]
+        for key in self.keys:
+            if key == self.reference_key:
+                continue
+            img = results[key]
+            if img.shape[:2] == (ref_h, ref_w):
+                continue
+            results[key] = mmcv.imresize(
+                img, (ref_w, ref_h), interpolation=self.interpolation,
+                backend='cv2')
+        return results
+
+    def __repr__(self):
+        return self.__class__.__name__ + '(keys={}, reference_key={}, interpolation={})'.format(
+            self.keys, self.reference_key, self.interpolation)
+
+
 @PIPELINES.register_module()
 class FlexibleRescaleToZeroOne(object):
     r"""Transform the images into a range between 0 and 1.

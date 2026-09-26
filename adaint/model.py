@@ -12,7 +12,7 @@ from mmcv.runner import auto_fp16
 from mmedit.models.base import BaseModel
 from mmedit.models.registry import MODELS
 from mmedit.models.builder import build_loss
-from mmedit.core import psnr, ssim, tensor2img
+from mmedit.core import delta_e, psnr, ssim, tensor2img
 from mmedit.utils import get_root_logger
 
 from ailut import ailut_transform
@@ -225,7 +225,7 @@ class AiLUT(BaseModel):
         test_cfg (dict, optional): Config for testing. Default: None.
     """
 
-    allowed_metrics = {'PSNR': psnr, 'SSIM': ssim}
+    allowed_metrics = {'PSNR': psnr, 'SSIM': ssim, 'deltaE': delta_e}
 
     def __init__(self,
         n_ranks=3,

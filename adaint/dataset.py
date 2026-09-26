@@ -106,6 +106,23 @@ class FiveK(BaseEnhanceDataset):
 
 
 @DATASETS.register_module()
+class Face(BaseEnhanceDataset):
+    r"""Custom face-retouching dataset for image enhancement.
+
+    Unlike FiveK/PPR10K, the LQ and GT images live in the SAME directory,
+    distinguished only by filename suffix (e.g. `{id}_input.jpg` /
+    `{id}_gt.jpg`). This is already supported by the base class: just pass
+    the same path as both `dir_lq` and `dir_gt`, with `filetmpl_lq` /
+    `filetmpl_gt` set to the corresponding suffix templates.
+
+    For the blind test split (no GT available), simply omit any GT-loading
+    step from the pipeline; `dir_gt`/`filetmpl_gt` are still required
+    arguments but will never be read from disk in that case.
+    """
+    pass
+
+
+@DATASETS.register_module()
 class PPR10K(BaseEnhanceDataset):
     r"""PPR10K dataset for image enhancement.
 

@@ -1,4 +1,4 @@
-exp_name = 'ailut_face_indoor_ban'
+exp_name = 'indoor_output1'
 
 custom_imports = dict(
     imports=['adaint'],
@@ -140,7 +140,7 @@ optimizers = dict(
 lr_config = None
 
 # learning policy
-total_iters = 67 * 400
+total_iters = 67 * 100
 
 checkpoint_config = dict(interval=67, save_optimizer=False, by_epoch=False)
 evaluation = dict(interval=67, save_image=False)

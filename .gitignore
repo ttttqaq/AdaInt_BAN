@@ -130,3 +130,7 @@ mmedit/.mim
 
 # include custom pretrained models
 !pretrained/*.pth
+
+
+/work_dirs
+/output

@@ -11,6 +11,7 @@ from mmedit.apis import multi_gpu_test, set_random_seed, single_gpu_test
 from mmedit.core.distributed_wrapper import DistributedDataParallelWrapper
 from mmedit.datasets import build_dataloader, build_dataset
 from mmedit.models import build_model
+from adaint.config_utils import load_config
 
 
 def parse_args():
@@ -48,7 +49,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    cfg = mmcv.Config.fromfile(args.config)
+    cfg = load_config(args.config)
     # set cudnn_benchmark
     if cfg.get('cudnn_benchmark', False):
         torch.backends.cudnn.benchmark = True

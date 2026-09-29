@@ -1,4 +1,4 @@
-exp_name = 'indoor_output1'
+exp_name = 'indoor_output2'
 
 custom_imports = dict(
     imports=['adaint'],
@@ -8,7 +8,7 @@ custom_imports = dict(
 # born-again student distilled from gen-1's best checkpoint). Reduced from
 # the paper's default (5-7) since the indoor set only has 67 training images
 # and more generations bring diminishing/risky returns on such little data.
-gen = 3
+gen = 4
 teacher_config_path = 'adaint/configs/face_indoor.py'
 kdloss_type = 'L1Loss'
 kdloss_weight = 1.0
@@ -19,7 +19,7 @@ model = dict(
     n_vertices=33,
     en_adaint=True,
     en_adaint_share=False,
-    backbone='tpami',  # 'res18'
+    backbone='res18',  # 'res18''tpami'
     pretrained=False,
     n_colors=3,
     sparse_factor=0.0001,

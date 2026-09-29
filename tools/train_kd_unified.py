@@ -8,8 +8,8 @@ import json
 import shutil
 
 import mmcv
-import torch
 from mmcv import Config
+import torch
 from mmcv.parallel import MMDataParallel
 from mmcv.runner import get_dist_info, init_dist, load_checkpoint
 
@@ -18,6 +18,7 @@ from mmedit.apis import set_random_seed, single_gpu_test, train_model
 from mmedit.datasets import build_dataloader, build_dataset
 from mmedit.models import build_model
 from mmedit.utils import collect_env, get_root_logger
+from adaint.config_utils import load_config
 
 
 def parse_args():
@@ -114,28 +115,52 @@ def infer_and_save_split(cfg, dataset_cfg, checkpoint_path, save_dir):
             os.replace(osp.join(save_dir, fname), osp.join(save_dir, new_name))
 
 
+def build_generation_config(base_cfg, gen, work_dir, args):
+    """Create an isolated config for one self-distillation generation.
+
+    MMCV's runner mutates hook configs while registering them (for example,
+    it removes ``lr_config['policy']``). Each generation therefore needs its
+    own deep copy instead of reusing the config passed to the previous run.
+    """
+    cfg = Config(
+        copy.deepcopy(base_cfg._cfg_dict),
+        filename=getattr(base_cfg, 'filename', None))
+    cfg.work_dir = osp.join(work_dir, f'gen_{gen}')
+    cfg.gpus = args.gpus
+
+    if args.resume_from is not None:
+        cfg.resume_from = args.resume_from
+
+    if args.autoscale_lr:
+        # Scale from the original base learning rate for every generation.
+        cfg.optimizers['lr'] = cfg.optimizers['lr'] * cfg.gpus / 8
+
+    if gen > 0:
+        model_path = osp.join(work_dir, f'gen_{gen-1}', 'best.pth')
+        cfg.model.kd_loss = dict(
+            type='KD_Loss',
+            config_path=cfg.teacher_config_path,
+            model_path=model_path,
+            loss_type=cfg.kdloss_type,
+            loss_weight=cfg.kdloss_weight)
+        cfg.model.gen = gen
+
+    return cfg
+
+
 def main():
     args = parse_args()
 
-    cfg = Config.fromfile(args.config)
+    base_cfg = load_config(args.config)
     if args.work_dir is not None:
         work_dir = args.work_dir
     else:
-        work_dir = cfg.work_dir
-    for gen in range(cfg.gen):
+        work_dir = base_cfg.work_dir
+    for gen in range(base_cfg.gen):
+        cfg = build_generation_config(base_cfg, gen, work_dir, args)
         # set cudnn_benchmark
         if cfg.get('cudnn_benchmark', False):
             torch.backends.cudnn.benchmark = True
-        # update configs according to CLI args
-        gen_dir = f'gen_{gen}'
-        cfg.work_dir = osp.join(work_dir, gen_dir)
-        if args.resume_from is not None:
-            cfg.resume_from = args.resume_from
-        cfg.gpus = args.gpus
-
-        if args.autoscale_lr:
-            # apply the linear scaling rule (https://arxiv.org/abs/1706.02677)
-            cfg.optimizer['lr'] = cfg.optimizer['lr'] * cfg.gpus / 8
 
         # init distributed env first, since logger depends on the dist info.
         if args.launcher == 'none':
@@ -170,14 +195,6 @@ def main():
             set_random_seed(args.seed, deterministic=args.deterministic)
         cfg.seed = args.seed
 
-        if gen > 0:
-            config_path = cfg.teacher_config_path
-            model_path = osp.join(work_dir, f'gen_{gen-1}', 'best.pth')
-            loss_type = cfg.kdloss_type
-            loss_weight = cfg.kdloss_weight
-            cfg.model.kd_loss = dict(type='KD_Loss', config_path=config_path, model_path=model_path,
-                                     loss_type=loss_type, loss_weight=loss_weight)
-            cfg.model.gen = gen
         model = build_model(
             cfg.model, train_cfg=cfg.train_cfg, test_cfg=cfg.test_cfg)
 

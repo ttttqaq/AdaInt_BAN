@@ -7,7 +7,6 @@ import time
 
 import mmcv
 import torch
-from mmcv import Config
 from mmcv.runner import init_dist
 
 from mmedit import __version__
@@ -15,6 +14,7 @@ from mmedit.apis import set_random_seed, train_model
 from mmedit.datasets import build_dataset
 from mmedit.models import build_model
 from mmedit.utils import collect_env, get_root_logger
+from adaint.config_utils import load_config
 
 
 def parse_args():
@@ -58,7 +58,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    cfg = Config.fromfile(args.config)
+    cfg = load_config(args.config)
     # set cudnn_benchmark
     if cfg.get('cudnn_benchmark', False):
         torch.backends.cudnn.benchmark = True
@@ -71,7 +71,7 @@ def main():
 
     if args.autoscale_lr:
         # apply the linear scaling rule (https://arxiv.org/abs/1706.02677)
-        cfg.optimizer['lr'] = cfg.optimizer['lr'] * cfg.gpus / 8
+        cfg.optimizers['lr'] = cfg.optimizers['lr'] * cfg.gpus / 8
 
     # init distributed env first, since logger depends on the dist info.
     if args.launcher == 'none':

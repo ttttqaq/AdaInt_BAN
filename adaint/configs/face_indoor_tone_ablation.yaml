@@ -13,7 +13,7 @@ gen: 4
 enable_kd: true
 teacher_config_path: adaint/configs/face_indoor_tone_ablation.yaml
 kdloss_type: L1Loss
-kdloss_weight: 0.25
+kdloss_weight: 1
 
 model:
   type: AiLUT_kd_unified
@@ -179,7 +179,7 @@ lr_config:
   min_lr: 0.000001
   by_epoch: false
 
-total_iters: 3350
+total_iters: 6700
 checkpoint_config:
   interval: 67
   save_optimizer: false

@@ -136,14 +136,16 @@ def build_generation_config(base_cfg, gen, work_dir, args):
         cfg.optimizers['lr'] = cfg.optimizers['lr'] * cfg.gpus / 8
 
     if gen > 0:
-        model_path = osp.join(work_dir, f'gen_{gen-1}', 'best.pth')
-        cfg.model.kd_loss = dict(
-            type='KD_Loss',
-            config_path=cfg.teacher_config_path,
-            model_path=model_path,
-            loss_type=cfg.kdloss_type,
-            loss_weight=cfg.kdloss_weight)
         cfg.model.gen = gen
+        cfg.model.kd_loss = None
+        if cfg.get('enable_kd', True):
+            model_path = osp.join(work_dir, f'gen_{gen-1}', 'best.pth')
+            cfg.model.kd_loss = dict(
+                type='KD_Loss',
+                config_path=cfg.teacher_config_path,
+                model_path=model_path,
+                loss_type=cfg.kdloss_type,
+                loss_weight=cfg.kdloss_weight)
 
     return cfg
 

@@ -108,7 +108,10 @@ class LUTGenerator(nn.Module):
                  use_tone_curve=False,
                  curve_points=17,
                  use_softmax_experts=False,
-                 expert_temperature=1.0):
+                 expert_temperature=1.0,
+                 tone_at_adaptive_vertices=False,
+                 diverse_expert_init=False,
+                 expert_init_scale=0.01):
         super().__init__()
 
         # h0
@@ -119,10 +122,19 @@ class LUTGenerator(nn.Module):
         self.curve_points = int(curve_points)
         self.use_softmax_experts = bool(use_softmax_experts)
         self.expert_temperature = max(float(expert_temperature), 1e-4)
+        self.tone_at_adaptive_vertices = bool(tone_at_adaptive_vertices)
+        self.diverse_expert_init = bool(diverse_expert_init)
+        self.expert_init_scale = float(expert_init_scale)
         if not 2 <= self.coarse_vertices <= n_vertices:
             raise ValueError('coarse_vertices must be between 2 and n_vertices')
         if self.use_tone_curve and (n_colors != 3 or self.curve_points < 2):
             raise ValueError('tone curves require RGB and at least two curve points')
+        if self.tone_at_adaptive_vertices and not self.use_tone_curve:
+            raise ValueError('tone_at_adaptive_vertices requires use_tone_curve')
+        if self.diverse_expert_init and (not self.use_softmax_experts or n_colors != 3):
+            raise ValueError('diverse_expert_init requires RGB softmax experts')
+        if self.diverse_expert_init and self.expert_init_scale <= 0:
+            raise ValueError('expert_init_scale must be positive')
         self.basis_luts_bank = nn.Linear(
             n_ranks, n_colors * (self.coarse_vertices ** n_colors), bias=False)
         if self.use_tone_curve:
@@ -142,7 +154,10 @@ class LUTGenerator(nn.Module):
 
         """
         if self.use_softmax_experts:
-            nn.init.zeros_(self.weights_generator.weight)
+            if self.diverse_expert_init:
+                nn.init.normal_(self.weights_generator.weight, std=1e-3)
+            else:
+                nn.init.zeros_(self.weights_generator.weight)
             nn.init.zeros_(self.weights_generator.bias)
         else:
             nn.init.ones_(self.weights_generator.bias)
@@ -169,18 +184,49 @@ class LUTGenerator(nn.Module):
                     self.n_ranks, -1).contiguous()
             self.basis_luts_bank.weight.data.copy_(identity_lut.t())
         if self.use_softmax_experts:
-            # Tiny expert differences break symmetry while keeping the initial
-            # mapping close to identity and the initial router uniform.
-            self.basis_luts_bank.weight.data.add_(
-                torch.randn_like(self.basis_luts_bank.weight) * 1e-3)
+            if self.diverse_expert_init:
+                self._init_diverse_experts()
+            else:
+                # Legacy initialization: tiny independent voxel noise.
+                self.basis_luts_bank.weight.data.add_(
+                    torch.randn_like(self.basis_luts_bank.weight) * 1e-3)
 
-    def _tone_curve_lut(self, x):
+    def _init_diverse_experts(self):
+        """Start with distinct smooth experts whose uniform mixture is zero."""
+        if self.n_ranks < 2:
+            return
+        weight = self.basis_luts_bank.weight
+        axis = torch.linspace(-1, 1, self.coarse_vertices,
+                              device=weight.device, dtype=weight.dtype)
+        r, g, b = torch.meshgrid(axis, axis, axis)
+        patterns = torch.stack((r, g, b, r * g, r * b, g * b, r * g * b))
+        coeff = torch.randn(self.n_ranks, self.n_colors, patterns.shape[0],
+                            device=weight.device, dtype=weight.dtype)
+        coeff -= coeff.mean(dim=0, keepdim=True)
+        residual = torch.einsum('mcp,pxyz->mcxyz', coeff, patterns)
+        residual *= self.expert_init_scale / residual.abs().max().clamp_min(1e-8)
+        with torch.no_grad():
+            weight.add_(residual.reshape(self.n_ranks, -1).t())
+
+    def _tone_curve_lut(self, x, vertices=None):
         raw = self.tone_curve_generator(x).view(
             x.shape[0], self.n_colors, self.curve_points)
         increments = raw.softmax(-1)
         curves = F.pad(increments.cumsum(-1), (1, 0), value=0.0)
-        curves = F.interpolate(
-            curves, size=self.n_vertices, mode='linear', align_corners=True)
+        if self.tone_at_adaptive_vertices:
+            if vertices is None:
+                raise ValueError('adaptive tone curves require sampling vertices')
+            # Curves have curve_points + 1 knots on [0, 1]. Evaluate their
+            # piecewise-linear interpolation at the actual AdaInt coordinates.
+            vertices = vertices.expand(x.shape[0], -1, -1)
+            position = vertices.clamp(0, 1) * self.curve_points
+            left = position.floor().long().clamp(max=self.curve_points - 1)
+            fraction = position - left.to(position.dtype)
+            curves = (curves.gather(-1, left) * (1 - fraction) +
+                      curves.gather(-1, left + 1) * fraction)
+        else:
+            curves = F.interpolate(
+                curves, size=self.n_vertices, mode='linear', align_corners=True)
         lut = curves.new_empty(
             x.shape[0], self.n_colors,
             self.n_vertices, self.n_vertices, self.n_vertices)
@@ -190,7 +236,7 @@ class LUTGenerator(nn.Module):
         lut[:, 2] = curves[:, 2].view(-1, self.n_vertices, 1, 1)
         return lut
 
-    def forward(self, x):
+    def forward(self, x, vertices=None):
         weights = self.weights_generator(x)
         if self.use_softmax_experts:
             weights = torch.softmax(weights / self.expert_temperature, dim=-1)
@@ -202,10 +248,11 @@ class LUTGenerator(nn.Module):
                 luts, size=(self.n_vertices,) * self.n_colors,
                 mode='trilinear', align_corners=True)
         if self.use_tone_curve:
-            luts = self._tone_curve_lut(x) + luts
+            luts = self._tone_curve_lut(x, vertices) + luts
         return weights, luts
 
-    def regularizations(self, smoothness, monotonicity):
+    def regularizations(self, smoothness, monotonicity, luts=None,
+                        monotonicity_on_fused_lut=False):
         basis_luts = self.basis_luts_bank.weight.t().view(
             self.n_ranks, self.n_colors,
             *((self.coarse_vertices,) * self.n_colors))
@@ -213,7 +260,13 @@ class LUTGenerator(nn.Module):
         for i in range(2, basis_luts.ndimension()):
             diff = torch.diff(basis_luts.flip(i), dim=i)
             tv += torch.square(diff).sum(0).mean()
-            mn += F.relu(diff).sum(0).mean()
+            if not monotonicity_on_fused_lut:
+                mn += F.relu(diff).sum(0).mean()
+        if monotonicity_on_fused_lut:
+            if luts is None:
+                raise ValueError('fused LUT regularization requires luts')
+            for i in range(2, luts.ndimension()):
+                mn += F.relu(torch.diff(luts.flip(i), dim=i)).mean()
         reg_smoothness = smoothness * tv
         reg_monotonicity = monotonicity * mn
         return reg_smoothness, reg_monotonicity
@@ -305,6 +358,10 @@ class AiLUT(BaseModel):
         curve_points=17,
         use_softmax_experts=False,
         expert_temperature=1.0,
+        tone_at_adaptive_vertices=False,
+        diverse_expert_init=False,
+        expert_init_scale=0.01,
+        monotonicity_on_fused_lut=False,
         en_adaint=True,
         en_adaint_share=False,
         backbone='tpami',
@@ -336,7 +393,10 @@ class AiLUT(BaseModel):
             use_tone_curve=use_tone_curve,
             curve_points=curve_points,
             use_softmax_experts=use_softmax_experts,
-            expert_temperature=expert_temperature)
+            expert_temperature=expert_temperature,
+            tone_at_adaptive_vertices=tone_at_adaptive_vertices,
+            diverse_expert_init=diverse_expert_init,
+            expert_init_scale=expert_init_scale)
 
         # mapping g
         if en_adaint:
@@ -355,6 +415,7 @@ class AiLUT(BaseModel):
         self.use_softmax_experts = bool(use_softmax_experts)
         self.smooth_factor = smooth_factor
         self.monotonicity_factor = monotonicity_factor
+        self.monotonicity_on_fused_lut = bool(monotonicity_on_fused_lut)
         self.backbone_name = backbone.lower()
 
         self.train_cfg = train_cfg
@@ -392,7 +453,7 @@ class AiLUT(BaseModel):
         if self.en_adaint:
             self.adaint.init_weights()
 
-    def forward_dummy(self, imgs):
+    def forward_dummy(self, imgs, return_luts=False):
         r"""The real implementation of model forward.
 
         Args:
@@ -403,16 +464,18 @@ class AiLUT(BaseModel):
         """
         # E: (b, f)
         codes = self.backbone(imgs)
-        # (b, m), T: (b, c, d, d, d)
-        weights, luts = self.lut_generator(codes)
         # \hat{P}: (b, c, d)
         if self.en_adaint:
             vertices = self.adaint(codes)
         else:
             vertices = self.uniform_vertices
+        # (b, m), T: (b, c, d, d, d)
+        weights, luts = self.lut_generator(codes, vertices=vertices)
 
         outs = ailut_transform(imgs, luts, vertices)
 
+        if return_luts:
+            return outs, weights, vertices, luts
         return outs, weights, vertices
 
     @auto_fp16(apply_to=('lq', ))
@@ -441,7 +504,8 @@ class AiLUT(BaseModel):
             outputs (dict): Output results.
         """
         losses = dict()
-        output, weights, vertices = self.forward_dummy(lq)
+        output, weights, vertices, luts = self.forward_dummy(
+            lq, return_luts=True)
         losses['loss_recons'] = self.recons_loss(output, gt)
         if self.sparse_factor > 0:
             if self.use_softmax_experts:
@@ -451,7 +515,9 @@ class AiLUT(BaseModel):
             else:
                 losses['loss_sparse'] = self.sparse_factor * torch.mean(weights.pow(2))
         reg_smoothness, reg_monotonicity = self.lut_generator.regularizations(
-            self.smooth_factor, self.monotonicity_factor)
+            self.smooth_factor, self.monotonicity_factor,
+            luts=luts,
+            monotonicity_on_fused_lut=self.monotonicity_on_fused_lut)
         if self.smooth_factor > 0:
             losses['loss_smooth'] = reg_smoothness
         if self.monotonicity_factor > 0:

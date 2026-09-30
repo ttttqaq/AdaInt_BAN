@@ -6,6 +6,10 @@ import os.path as osp
 import time
 import json
 import shutil
+import sys
+
+# Prefer this checkout over any editable installation of the project.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mmcv
 from mmcv import Config

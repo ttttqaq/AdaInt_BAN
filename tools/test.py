@@ -1,6 +1,10 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import argparse
 import os
+import sys
+
+# Prefer this checkout over any editable installation of the project.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mmcv
 import torch

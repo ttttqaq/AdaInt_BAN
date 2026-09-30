@@ -4,6 +4,10 @@ import copy
 import os
 import os.path as osp
 import time
+import sys
+
+# Prefer this checkout over any editable installation of the project.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mmcv
 import torch

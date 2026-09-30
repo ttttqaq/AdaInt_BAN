@@ -1,7 +1,7 @@
 # Main-branch AiLUT-BAN baseline with one experimental change:
 # for gen > 0, use 0.25 * L1(student, previous generation's teacher).
 # gen 0 has no distillation loss. Edit kdloss_weight to run another ablation.
-exp_name: indoor_kd025_from_main
+exp_name: indoor_kd05
 
 custom_imports:
   imports: [adaint]
@@ -10,7 +10,7 @@ custom_imports:
 gen: 3
 teacher_config_path: adaint/configs/face_indoor.py
 kdloss_type: L1Loss
-kdloss_weight: 0.25
+kdloss_weight: 0.5
 
 model:
   type: AiLUT_kd_unified
@@ -142,7 +142,7 @@ optimizers:
         lr_mult: 0.1
 lr_config: null
 
-total_iters: 6700
+total_iters: 3350
 checkpoint_config:
   interval: 67
   save_optimizer: false
@@ -160,7 +160,7 @@ visual_config: null
 dist_params:
   backend: nccl
 log_level: INFO
-work_dir: ./work_dirs/indoor_kd025_from_main
+work_dir: ./work_dirs/indoor_kd05
 load_from: null
 resume_from: null
 workflow:

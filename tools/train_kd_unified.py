@@ -9,7 +9,6 @@ import shutil
 
 import mmcv
 import torch
-from mmcv import Config
 from mmcv.parallel import MMDataParallel
 from mmcv.runner import get_dist_info, init_dist, load_checkpoint
 
@@ -18,6 +17,7 @@ from mmedit.apis import set_random_seed, single_gpu_test, train_model
 from mmedit.datasets import build_dataloader, build_dataset
 from mmedit.models import build_model
 from mmedit.utils import collect_env, get_root_logger
+from adaint.config_utils import load_config
 
 
 def parse_args():
@@ -117,7 +117,7 @@ def infer_and_save_split(cfg, dataset_cfg, checkpoint_path, save_dir):
 def main():
     args = parse_args()
 
-    cfg = Config.fromfile(args.config)
+    cfg = load_config(args.config)
     if args.work_dir is not None:
         work_dir = args.work_dir
     else:

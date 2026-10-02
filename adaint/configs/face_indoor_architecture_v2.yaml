@@ -1,4 +1,4 @@
-exp_name: indoor_architecture_v2_all_on
+exp_name: indoor_archv2_only_spatial_smoothness
 custom_imports:
   imports:
     - adaint
@@ -45,13 +45,13 @@ model:
   expert_init_scale: 0.01
 
   # Independent constraint switches.
-  use_interval_floor: true
+  use_interval_floor: false
   min_interval: 0.001
-  use_flexible_tone_endpoints: true
+  use_flexible_tone_endpoints: false
   tone_endpoint_range: 0.05
   # true: constrain only dR/dR, dG/dG, dB/dB;
   # false: reproduce the legacy all-nine-partial-derivatives constraint.
-  use_diagonal_monotonicity: true
+  use_diagonal_monotonicity: false
   use_spatial_smoothness: true
   spatial_smoothness_factor: 0.001
 
@@ -62,7 +62,7 @@ model:
   n_colors: 3
   sparse_factor: 0.0
   smooth_factor: 0.0
-  monotonicity_factor: 10.0
+  monotonicity_factor: 2.0
   recons_loss:
     type: L1Loss
     loss_weight: 1.0
@@ -219,7 +219,7 @@ visual_config: null
 dist_params:
   backend: nccl
 log_level: INFO
-work_dir: ./work_dirs/indoor_architecture_v2_all_on
+work_dir: ./work_dirs/indoor_archv2_only_spatial_smoothness
 load_from: null
 resume_from: null
 workflow:

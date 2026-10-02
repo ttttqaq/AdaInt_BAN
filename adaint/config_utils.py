@@ -39,4 +39,6 @@ def load_config(filename):
     if custom_imports:
         from mmcv.utils import import_modules_from_strings
         import_modules_from_strings(**custom_imports)
+    from .context_transform import configure_context_pipeline
+    configure_context_pipeline(cfg)
     return cfg

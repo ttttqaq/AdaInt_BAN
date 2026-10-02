@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import argparse
 import copy
+import glob
 import os
 import os.path as osp
 import time
@@ -23,6 +24,9 @@ from mmedit.datasets import build_dataloader, build_dataset
 from mmedit.models import build_model
 from mmedit.utils import collect_env, get_root_logger
 from adaint.config_utils import load_config
+from adaint.experiment_utils import (
+    REFINEMENT_TYPES, inference_config, load_enhancer_checkpoint,
+    resolve_training_schedule, save_generation_configs)
 
 
 def parse_args():
@@ -41,6 +45,8 @@ def parse_args():
         default=1,
         help='number of gpus to use '
         '(only applicable to non-distributed training)')
+    parser.add_argument('--start-gen', type=int, default=0,
+                        help='start at an existing generation after interruption')
     parser.add_argument('--seed', type=int, default=None, help='random seed')
     parser.add_argument(
         '--deterministic',
@@ -103,8 +109,12 @@ def infer_and_save_split(cfg, dataset_cfg, checkpoint_path, save_dir):
     # missing GT image.
     infer_test_cfg = copy.deepcopy(cfg.test_cfg)
     infer_test_cfg['metrics'] = None
-    model = build_model(cfg.model, train_cfg=None, test_cfg=infer_test_cfg)
-    load_checkpoint(model, checkpoint_path, map_location='cpu')
+    model_cfg = inference_config(cfg).model
+    model = build_model(model_cfg, train_cfg=None, test_cfg=infer_test_cfg)
+    if model_cfg.type in REFINEMENT_TYPES:
+        load_enhancer_checkpoint(model, checkpoint_path)
+    else:
+        load_checkpoint(model, checkpoint_path, map_location='cpu')
     model = MMDataParallel(model.cuda(), device_ids=[0])
 
     mmcv.mkdir_or_exist(save_dir)
@@ -132,8 +142,16 @@ def build_generation_config(base_cfg, gen, work_dir, args):
     cfg.work_dir = osp.join(work_dir, f'gen_{gen}')
     cfg.gpus = args.gpus
 
-    if args.resume_from is not None:
+    # A resume checkpoint belongs only to the first selected generation.
+    # Following generations start afresh and distil the previous best model.
+    cfg.resume_from = base_cfg.get('resume_from') if gen == args.start_gen else None
+    if args.resume_from is not None and gen == args.start_gen:
         cfg.resume_from = args.resume_from
+    if cfg.resume_from and cfg.model.type in REFINEMENT_TYPES:
+        hooks = cfg.get('custom_hooks', [])
+        if not any(hook['type'] == 'LUTResumeCounterHook' for hook in hooks):
+            hooks.append(dict(type='LUTResumeCounterHook', priority='HIGHEST'))
+        cfg.custom_hooks = hooks
 
     if args.autoscale_lr:
         # Scale from the original base learning rate for every generation.
@@ -146,7 +164,9 @@ def build_generation_config(base_cfg, gen, work_dir, args):
             model_path = osp.join(work_dir, f'gen_{gen-1}', 'best.pth')
             cfg.model.kd_loss = dict(
                 type='KD_Loss',
-                config_path=cfg.teacher_config_path,
+                config_path=(osp.join(work_dir, f'gen_{gen-1}', 'inference_config.py')
+                             if osp.isfile(osp.join(work_dir, f'gen_{gen-1}', 'inference_config.py'))
+                             else cfg.teacher_config_path),
                 model_path=model_path,
                 loss_type=cfg.kdloss_type,
                 loss_weight=cfg.kdloss_weight)
@@ -162,7 +182,11 @@ def main():
         work_dir = args.work_dir
     else:
         work_dir = base_cfg.work_dir
-    for gen in range(base_cfg.gen):
+    if args.no_validate:
+        raise ValueError('train_kd_unified requires validation to select best.pth')
+    if not 0 <= args.start_gen < base_cfg.gen:
+        raise ValueError('--start-gen must be within configured generations')
+    for gen in range(args.start_gen, base_cfg.gen):
         cfg = build_generation_config(base_cfg, gen, work_dir, args)
         # set cudnn_benchmark
         if cfg.get('cudnn_benchmark', False):
@@ -201,10 +225,23 @@ def main():
             set_random_seed(args.seed, deterministic=args.deterministic)
         cfg.seed = args.seed
 
+        datasets = [build_dataset(cfg.data.train)]
+        resolve_training_schedule(cfg, len(datasets[0]), distributed)
+        if not cfg.get('checkpoint_config') or not cfg.get('evaluation'):
+            raise ValueError('generation training needs checkpoint and evaluation hooks')
+        checkpoint_interval = cfg.checkpoint_config.interval
+        evaluation_interval = cfg.evaluation.interval
+        if (checkpoint_interval < 1 or evaluation_interval < 1 or
+                evaluation_interval % checkpoint_interval != 0):
+            raise ValueError('evaluation interval must be a positive multiple of '
+                             'checkpoint interval to select an existing best checkpoint')
+        logger.info('Resolved training budget: %s images, %s iters/generation, '
+                    '%s AdaInt freeze iters', len(datasets[0]), cfg.total_iters,
+                    cfg.train_cfg.get('n_fix_iters', 0))
+        save_generation_configs(cfg)
         model = build_model(
             cfg.model, train_cfg=cfg.train_cfg, test_cfg=cfg.test_cfg)
 
-        datasets = [build_dataset(cfg.data.train)]
         if len(cfg.workflow) == 2:
             val_dataset = copy.deepcopy(cfg.data.val)
             val_dataset.pipeline = cfg.data.train.pipeline
@@ -236,17 +273,17 @@ def main():
             timestamp=timestamp,
             meta=meta)
 
-        json_file_path = osp.join(cfg.work_dir, f'{timestamp}.log.json')
-        # 读取JSON文件内容
-        with open(json_file_path, 'r') as file:
-            json_data = file.read()
-
-        # 将JSON数据解析为Python对象
-        data_list = [json.loads(line)
-                     for line in json_data.split('\n') if line.strip()]
+        # Include this generation's earlier validation history after a resume.
+        data_list = []
+        for json_file_path in sorted(glob.glob(osp.join(cfg.work_dir, '*.log.json'))):
+            with open(json_file_path) as file:
+                data_list.extend(json.loads(line) for line in file if line.strip())
         # 找到所有mode为val的PSNR
         val_psnr_list = [(entry['iter'], entry['PSNR'])
                          for entry in data_list if entry.get('mode') == 'val']
+        if not val_psnr_list:
+            raise ValueError('no validation PSNR recorded; total_iters must reach '
+                             'the evaluation interval')
 
         # 找到PSNR最大的iter
         max_psnr_entry = max(val_psnr_list, key=lambda x: x[1])
@@ -267,7 +304,7 @@ def main():
         # 子目录，文件名为 {id}_result.png。分布式训练时只在 rank 0 上跑一次，
         # 避免重复推理。
         rank, _ = get_dist_info()
-        if not distributed or rank == 0:
+        if cfg.get('infer_after_generation', True) and (not distributed or rank == 0):
             infer_save_dir = osp.join(cfg.work_dir, 'train_infer')
             infer_and_save_split(cfg, cfg.data.train, destination_file, infer_save_dir)
             infer_and_save_split(cfg, cfg.data.val, destination_file, infer_save_dir)

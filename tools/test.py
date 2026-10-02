@@ -16,6 +16,7 @@ from mmedit.core.distributed_wrapper import DistributedDataParallelWrapper
 from mmedit.datasets import build_dataloader, build_dataset
 from mmedit.models import build_model
 from adaint.config_utils import load_config
+from adaint.experiment_utils import REFINEMENT_TYPES, load_enhancer_checkpoint
 
 
 def parse_args():
@@ -23,6 +24,8 @@ def parse_args():
     parser.add_argument('config', help='test config file path')
     parser.add_argument('checkpoint', help='checkpoint file')
     parser.add_argument('--seed', type=int, default=None, help='random seed')
+    parser.add_argument('--eval-val', action='store_true',
+                        help='evaluate the paired validation split with PSNR and deltaE')
     parser.add_argument(
         '--deterministic',
         action='store_true',
@@ -54,6 +57,11 @@ def main():
     args = parse_args()
 
     cfg = load_config(args.config)
+    if args.eval_val:
+        if not cfg.data.get('val'):
+            raise ValueError('--eval-val needs the saved inference_config.py with data.val')
+        cfg.data.test = cfg.data.val
+        cfg.test_cfg = dict(metrics=['PSNR', 'deltaE'], crop_border=0)
     # set cudnn_benchmark
     if cfg.get('cudnn_benchmark', False):
         torch.backends.cudnn.benchmark = True
@@ -96,8 +104,11 @@ def main():
     args.save_image = args.save_path is not None
     empty_cache = cfg.get('empty_cache', False)
     if not distributed:
-        _ = load_checkpoint(model, args.checkpoint, map_location='cpu')
-        model = MMDataParallel(model, device_ids=[0])
+        if cfg.model.type in REFINEMENT_TYPES:
+            load_enhancer_checkpoint(model, args.checkpoint)
+        else:
+            load_checkpoint(model, args.checkpoint, map_location='cpu')
+        model = MMDataParallel(model.cuda(), device_ids=[0])
         outputs = single_gpu_test(
             model,
             data_loader,
@@ -112,10 +123,12 @@ def main():
             find_unused_parameters=find_unused_parameters)
 
         device_id = torch.cuda.current_device()
-        _ = load_checkpoint(
-            model,
-            args.checkpoint,
-            map_location=lambda storage, loc: storage.cuda(device_id))
+        if cfg.model.type in REFINEMENT_TYPES:
+            load_enhancer_checkpoint(model.module, args.checkpoint)
+        else:
+            _ = load_checkpoint(
+                model, args.checkpoint,
+                map_location=lambda storage, loc: storage.cuda(device_id))
         outputs = multi_gpu_test(
             model,
             data_loader,

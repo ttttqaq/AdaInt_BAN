@@ -1,4 +1,4 @@
-exp_name: v3_ready
+exp_name: v3_ready_kd
 custom_imports:
   imports:
   - adaint
@@ -9,7 +9,7 @@ adaint_fix_epochs: 5
 checkpoint_interval_epochs: 1
 evaluation_interval_epochs: 1
 context_size: 256
-infer_after_generation: false
+infer_after_generation: true
 enable_kd: true
 teacher_config_path: adaint/configs/generated/v3_ready.yaml
 kdloss_type: L1Loss
@@ -53,7 +53,7 @@ model:
   use_kd_decay: true
   kd_decay_start_ratio: 0.3
   kd_decay_end_ratio: 1.0
-  kd_final_weight: 0.1
+  kd_final_weight: 0.5
   use_confidence_kd: false
   confidence_temperature: 0.05
   use_lab_loss: true
@@ -244,7 +244,7 @@ visual_config: null
 dist_params:
   backend: nccl
 log_level: INFO
-work_dir: ./work_dirs/v3_ready
+work_dir: ./work_dirs/v3_ready_kd
 load_from: null
 resume_from: null
 workflow:

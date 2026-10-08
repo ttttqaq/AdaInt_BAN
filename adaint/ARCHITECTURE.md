@@ -1,6 +1,6 @@
 **本分支唯一模型：AiLUT，全局 tone/AdaInt LUT ＋局部仿射修正**
 
-适用分支：`feature/lut-refinement__from_lut-architecture-v2`。本次实施依据“分析 PPR10K 训练效果下滑”对话的最后一轮优化方案。当前只注册一个图像增强模型 `AiLUT`；BAN 使用相同架构的冻结教师，不另设模型类。
+适用分支：`feature/global-affine__from_lut-refinement`。本次实施依据“分析 PPR10K 训练效果下滑”对话的最后一轮优化方案。当前只注册一个图像增强模型 `AiLUT`；BAN 使用相同架构的冻结教师，不另设模型类。
 
 **完整前向路径**
 

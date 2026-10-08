@@ -1,6 +1,6 @@
 **本分支 PPR10K 训练和验证**
 
-项目位置：`/remote-home/share/yujietang/image_enhance/my_code/AdaInt_BAN`。分支：`feature/lut-refinement__from_lut-architecture-v2`。唯一模型为 `AiLUT`，详细架构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+项目位置：`/remote-home/share/yujietang/image_enhance/my_code/AdaInt_BAN`。分支：`feature/global-affine__from_lut-refinement`。唯一模型为 `AiLUT`，详细架构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 默认继续使用现有 PNG 文件和划分：`/remote-home/share/yujietang/dataset/PRR10K/prr_train/source` 配对 `target_a`；验证位于 `prr_value/source`、`prr_value/target_a`，HC mask 位于 `masks_360p`。没有额外启用官方五种增强或更换数据版本。
 

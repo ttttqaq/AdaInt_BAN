@@ -1,6 +1,6 @@
 **AdaInt-BAN：单架构 tone/LUT 与局部修正分支**
 
-本分支 `feature/lut-refinement__from_lut-architecture-v2` 只保留 `AiLUT` 一个增强模型：整图条件预测 tone、AdaInt 与完整 33³ 全局 LUT；原始 RGB 坐标查询后添加直接学习的局部仿射修正。BAN 复用相同架构的冻结教师。
+本分支 `feature/global-affine__from_lut-refinement` 只保留 `AiLUT` 一个增强模型：整图条件预测 tone、AdaInt 与完整 33³ 全局 LUT；原始 RGB 坐标查询后添加直接学习的局部仿射修正。BAN 复用相同架构的冻结教师。
 
 - [完整架构、改前对比与训练目标](adaint/ARCHITECTURE.md)
 - [PPR10K 训练、恢复和验证命令](adaint/PPR10K.md)

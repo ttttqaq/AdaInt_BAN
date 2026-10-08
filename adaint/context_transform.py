@@ -1,7 +1,6 @@
 """Joint augmentation with full-image context and normalized crop coordinates."""
 import random
 
-import mmcv
 import numpy as np
 import torch
 from PIL import Image
@@ -37,8 +36,10 @@ class ContextAwareAugment:
         crop_w = max(1, int(width * random.uniform(*self.crop_ratio)))
         top = random.randint(0, height - crop_h)
         left = random.randint(0, width - crop_w)
-        results['lq_context'] = mmcv.imresize(
-            lq, (self.context_size,) * 2, interpolation='bilinear')
+        context = torch.from_numpy(lq).permute(2, 0, 1).unsqueeze(0).float().div(255.)
+        results['lq_context'] = torch.nn.functional.interpolate(
+            context, (self.context_size,) * 2, mode='bilinear',
+            align_corners=False)[0].permute(1, 2, 0).numpy()
         ys = np.minimum(((np.arange(self.samples_size) + 0.5) *
                          height / self.samples_size).astype(int), height - 1)
         xs = np.minimum(((np.arange(self.samples_size) + 0.5) *
@@ -55,7 +56,7 @@ class ContextAwareAugment:
 def configure_context_pipeline(cfg):
     """Wire the context toggle into the training pipeline, keeping old configs intact."""
     model = cfg.get('model', {})
-    if not model.get('use_full_image_context', False) or not cfg.get('data', {}).get('train'):
+    if model.get('type') != 'AiLUT' or not cfg.get('data', {}).get('train'):
         return cfg
     pipeline = cfg.data.train.pipeline
     if any(step['type'] == 'ContextAwareAugment' for step in pipeline):
@@ -76,7 +77,7 @@ def configure_context_pipeline(cfg):
         if step['type'] == 'RandomRatioCrop':
             updated.append(dict(
                 type='ContextAwareAugment',
-                context_size=cfg.get('context_size', 256),
+                context_size=model.get('context_size', 256),
                 samples_size=model.get('stats_pool_size', 64),
                 crop_ratio=crop['crop_ratio'], flip_ratio=flip.get('flip_ratio', 0.5),
                 brightness=jitter.get('brightness', 0),

@@ -10,7 +10,7 @@ from mmcv import Config
 from mmcv.runner import HOOKS, Hook, get_dist_info
 from .epoch_hooks import configure_epoch_display
 
-REFINEMENT_TYPES = ('AiLUTRefinementBase', 'AiLUTArchitectureV3', 'AiLUTGlobalLocalV3')
+ENHANCER_TYPES = ('AiLUT',)
 
 
 @HOOKS.register_module()
@@ -71,7 +71,7 @@ def resolve_training_schedule(cfg, dataset_size, distributed=False):
                 if hook['type'] in ('TextLoggerHook', 'LUTEpochTextLoggerHook'):
                     hook.update(type='LUTEpochTextLoggerHook', by_epoch=False,
                                 steps_per_epoch=steps, total_epochs=cfg.train_epochs)
-    if cfg.model.type in REFINEMENT_TYPES:
+    if cfg.model.type in ENHANCER_TYPES:
         cfg.train_cfg.total_iters = cfg.total_iters
     return cfg
 
@@ -106,7 +106,7 @@ def public_training_config(cfg):
 
 def select_best_checkpoint(records, work_dir, steps_per_epoch=None):
     """Read new epoch logs and existing iteration logs when resuming."""
-    candidates = []
+    candidates = {}
     for entry in records:
         if entry.get('mode') != 'val' or 'PSNR' not in entry:
             continue
@@ -119,10 +119,12 @@ def select_best_checkpoint(records, work_dir, steps_per_epoch=None):
             filename = 'epoch_{}.pth'.format(entry['epoch'])
         else:
             continue
-        candidates.append((entry['PSNR'], progress, os.path.join(work_dir, filename)))
+        # A resumed run can overwrite the same epoch/iteration file. Retain
+        # its latest validation, otherwise an older score can describe new weights.
+        candidates[filename] = (entry['PSNR'], progress, os.path.join(work_dir, filename))
     if not candidates:
         raise ValueError('no validation PSNR recorded; training must reach its evaluation period')
-    return max(candidates, key=lambda item: item[0])
+    return max(candidates.values(), key=lambda item: item[0])
 
 
 def inference_config(cfg):
@@ -170,5 +172,18 @@ def load_enhancer_checkpoint(model, filename):
              for key, value in state.items()}
     state = {key: value for key, value in state.items()
              if not key.startswith('kd_loss.')}
-    model.load_state_dict(state, strict=True)
+    current = model.state_dict()
+    expected = {key: value for key, value in current.items()
+                if not key.startswith('kd_loss.')}
+    missing = sorted(set(expected)-set(state))
+    unexpected = sorted(set(state)-set(expected))
+    shapes = sorted(key for key in set(state) & set(expected)
+                    if state[key].shape != expected[key].shape)
+    if missing or unexpected or shapes:
+        raise RuntimeError('incompatible AiLUT checkpoint: missing={}, unexpected={}, '
+                           'shape_mismatches={}'.format(missing, unexpected, shapes))
+    # A training model may already contain its frozen, separately loaded teacher.
+    # Validate every enhancer key, then preserve that teacher during preflight.
+    current.update(state)
+    model.load_state_dict(current, strict=True)
     return checkpoint

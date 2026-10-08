@@ -1,76 +1,47 @@
-exp_name: v3_ready
+exp_name: face_indoor_global_affine
 custom_imports:
   imports:
   - adaint
   allow_failed_imports: false
-gen: 4
+gen: 1
 train_epochs: 100
 adaint_fix_epochs: 5
 checkpoint_interval_epochs: 1
 evaluation_interval_epochs: 1
-context_size: 256
 infer_after_generation: false
-enable_kd: true
-teacher_config_path: adaint/configs/generated/v3_ready.yaml
-kdloss_type: L1Loss
-kdloss_weight: 1
+enable_kd: false
+kdloss_type: MSELoss
+kdloss_weight: 0.1
 model:
-  type: AiLUTArchitectureV3
-  n_ranks: 4
+  type: AiLUT
+  n_ranks: 5
   n_vertices: 33
-  coarse_vertices: 17
   curve_points: 16
   stats_bins: 16
   stats_pool_size: 64
   condition_dim: 256
   head_hidden_dim: 128
-  vertex_embedding_dim: 64
-  n_spatial_luts: 2
-  guide_resolution: 128
-  guide_channels: 16
-  guide_temperature: 1.0
-  signed_weight_scale: 1.0
-  expert_init_scale: 0.01
-  use_interval_floor: false
+  local_resolution: 128
+  local_channels: 16
+  context_size: 256
   min_interval: 0.001
-  use_flexible_tone_endpoints: false
-  tone_endpoint_range: 0.05
-  use_diagonal_monotonicity: true
-  use_spatial_smoothness: true
-  spatial_smoothness_factor: 0.001
-  en_adaint: true
-  en_adaint_share: false
-  backbone: tpami
-  pretrained: false
-  n_colors: 3
-  sparse_factor: 0.0
-  smooth_factor: 0.0
-  monotonicity_factor: 2.0
-  recons_loss:
-    type: L1Loss
-    loss_weight: 1.0
-  use_stratified_statistics: true
-  use_kd_decay: true
-  kd_decay_start_ratio: 0.3
-  kd_decay_end_ratio: 1.0
-  kd_final_weight: 0.1
-  use_confidence_kd: false
-  confidence_temperature: 0.05
-  use_lab_loss: true
-  lab_loss_weight: 0.05
-  use_rgb_mse_loss: false
-  rgb_mse_loss_weight: 0.1
-  use_low_frequency_loss: false
-  low_frequency_loss_weight: 0.1
-  low_frequency_size: 32
-  use_edge_aware_smoothness: true
-  edge_smoothness_scale: 10.0
-  use_full_image_context: true
   guided_filter_radius: 2
   guided_filter_epsilon: 0.001
-train_cfg: null
+  backbone: tpami
+  pretrained: false
+  smooth_factor: 1.0e-05
+  monotonicity_factor: 0.01
+  global_magnitude_factor: 1.0e-05
+  local_magnitude_factor: 0.001
+  local_smoothness_factor: 0.0001
+  edge_smoothness_scale: 10.0
+  kd_decay_start_ratio: 0.3
+  kd_decay_end_ratio: 1.0
+  kd_final_weight: 0.0
 test_cfg:
-  metrics: null
+  metrics:
+  - PSNR
+  - deltaE
   crop_border: 0
 train_pipeline:
 - type: LoadImageFromFile
@@ -173,10 +144,112 @@ blind_test_pipeline:
   meta_keys:
   - lq_path
 data:
-  workers_per_gpu: 1
+  workers_per_gpu: 4
+  train_dataloader:
+    samples_per_gpu: 1
+  val_dataloader:
+    samples_per_gpu: 1
   test_dataloader:
     samples_per_gpu: 1
     workers_per_gpu: 1
+  train:
+    type: Face
+    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/all/1_indoors_data
+    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/all/1_indoors_data
+    ann_file: adaint/annfiles/Face/indoor_train.txt
+    pipeline:
+    - type: LoadImageFromFile
+      io_backend: disk
+      key: lq
+      backend: pillow
+      channel_order: rgb
+    - type: LoadImageFromFile
+      io_backend: disk
+      key: gt
+      backend: pillow
+      channel_order: rgb
+    - type: ResizeToMatch
+      keys:
+      - lq
+      reference_key: gt
+      interpolation: area
+    - type: RandomRatioCrop
+      keys:
+      - lq
+      - gt
+      crop_ratio:
+      - 0.6
+      - 1.0
+    - type: Flip
+      keys:
+      - lq
+      - gt
+      flip_ratio: 0.5
+      direction: horizontal
+    - type: RandomColorJitter
+      keys:
+      - lq
+      brightness: 0.2
+      saturation: 0.2
+    - type: FlexibleRescaleToZeroOne
+      keys:
+      - lq
+      - gt
+      precision: 32
+    - type: ImageToTensor
+      keys:
+      - lq
+      - gt
+    - type: Collect
+      keys:
+      - lq
+      - gt
+      meta_keys:
+      - lq_path
+      - gt_path
+    test_mode: false
+    filetmpl_lq: '{}_input.jpg'
+    filetmpl_gt: '{}_gt.jpg'
+  val:
+    type: Face
+    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/all/1_indoors_data
+    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/all/1_indoors_data
+    ann_file: adaint/annfiles/Face/indoor_val.txt
+    pipeline:
+    - type: LoadImageFromFile
+      io_backend: disk
+      key: lq
+      backend: pillow
+      channel_order: rgb
+    - type: LoadImageFromFile
+      io_backend: disk
+      key: gt
+      backend: pillow
+      channel_order: rgb
+    - type: ResizeToMatch
+      keys:
+      - lq
+      reference_key: gt
+      interpolation: area
+    - type: FlexibleRescaleToZeroOne
+      keys:
+      - lq
+      - gt
+      precision: 32
+    - type: ImageToTensor
+      keys:
+      - lq
+      - gt
+    - type: Collect
+      keys:
+      - lq
+      - gt
+      meta_keys:
+      - lq_path
+      - gt_path
+    test_mode: true
+    filetmpl_lq: '{}_input.jpg'
+    filetmpl_gt: '{}_gt.jpg'
   test:
     type: Face
     dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/all/3_test_data
@@ -219,27 +292,20 @@ lr_config:
   policy: CosineAnnealing
   min_lr: 1.0e-06
   by_epoch: false
-total_iters: 6700
 checkpoint_config:
-  interval: 67
   save_optimizer: true
-  by_epoch: false
 evaluation:
-  interval: 67
   save_image: false
 log_config:
-  interval: 20
   hooks:
-  - type: TextLoggerHook
-    by_epoch: false
+  - type: LUTEpochTextLoggerHook
 visual_config: null
 dist_params:
   backend: nccl
 log_level: INFO
-work_dir: ./work_dirs/v3_ready/test
+work_dir: ./work_dirs/face_indoor_global_affine
 load_from: null
 resume_from: null
-workflow:
-- - train
-  - 1
 find_unused_parameters: true
+log_interval_epochs: 1
+dataset: face

@@ -1,5 +1,6 @@
 """Native-resolution batched enhancement evaluation and per-image results."""
 from functools import partial
+from unittest.mock import patch
 
 import mmcv
 import numpy as np
@@ -10,8 +11,7 @@ from PIL import Image
 from torch.utils.data import DataLoader
 
 from adaint.dataset import PPR10KFolder
-from adaint.model_architecture_v2 import AiLUTArchitectureV2
-from adaint.model_refinement import AiLUTArchitectureV3, AiLUTGlobalLocalV3
+from adaint.model import AiLUT
 from mmedit.apis import single_gpu_test, multi_gpu_test
 from mmedit.datasets import build_dataloader
 from mmedit.datasets.samplers import DistributedSampler
@@ -21,7 +21,7 @@ import mmedit.apis.test as test_api
 METRICS = ['PSNR', 'deltaE', 'PSNR_hc', 'deltaE_hc']
 
 
-class PointEnhancer(AiLUTArchitectureV2):
+class PointEnhancer(AiLUT):
     """Exercise the production test path without the CUDA-only LUT kernel."""
     def __init__(self, metrics=METRICS):
         torch.nn.Module.__init__(self)
@@ -32,6 +32,13 @@ class PointEnhancer(AiLUTArchitectureV2):
     def forward_dummy(self, lq):
         self.calls.append(tuple(lq.shape))
         return lq * 0.8, None, None
+
+
+def cpu_parallel(model):
+    # PyTorch 1.8 cannot construct device_ids=[] when CUDA is available.
+    # These regressions explicitly exercise MMCV's CPU scatter path.
+    with patch('torch.cuda.is_available', return_value=False):
+        return MMDataParallel(model, device_ids=[])
 
 
 def folder_dataset(tmp_path, count):
@@ -86,7 +93,7 @@ def test_native_resolution_batch64_preserves_order_metrics_and_last_sample(tmp_p
     loader = build_dataloader(
         dataset, samples_per_gpu=64, workers_per_gpu=workers,
         dist=False, shuffle=False, persistent_workers=False)
-    results = single_gpu_test(MMDataParallel(model, device_ids=[]), loader)
+    results = single_gpu_test(cpu_parallel(model), loader)
     assert_metrics_equal(results, expected)
     assert sorted(call[0] for call in model.calls) == [1, 16, 16, 32]
     assert {call[2:] for call in model.calls} == {(24, 36), (36, 24), (28, 36)}
@@ -145,22 +152,20 @@ def test_distributed_collection_keeps_image_order_and_removes_sampler_padding(tm
             dataset, batch_size=3, sampler=sampler,
             collate_fn=partial(collate, samples_per_gpu=3))
         results = multi_gpu_test(
-            MMDataParallel(model, device_ids=[]), loader, tmpdir=str(collection_dir))
+            cpu_parallel(model), loader, tmpdir=str(collection_dir))
         if rank == 1:
             assert results is None
     assert_metrics_equal(results, expected)
 
 
-@pytest.mark.parametrize('model_type', [AiLUTArchitectureV3, AiLUTGlobalLocalV3])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='real AiLUT CUDA extension')
-def test_cuda_models_batched_metrics_match_individual_evaluation(tmp_path, model_type):
+def test_cuda_models_batched_metrics_match_individual_evaluation(tmp_path):
     dataset = folder_dataset(tmp_path, 65)
-    model = model_type(
-        n_vertices=9, coarse_vertices=5, curve_points=4,
+    model = AiLUT(
+        n_vertices=9, curve_points=4,
         stats_bins=8, stats_pool_size=16, condition_dim=32,
-        head_hidden_dim=16, vertex_embedding_dim=8,
-        guide_resolution=32, guide_channels=4,
-        use_interval_floor=False, use_flexible_tone_endpoints=False,
+        head_hidden_dim=16,
+        local_resolution=32, local_channels=4, context_size=32,
         test_cfg=mmcv.ConfigDict(metrics=METRICS, crop_border=0)).cuda().eval()
     expected = []
     with torch.no_grad():

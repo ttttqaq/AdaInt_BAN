@@ -1,5 +1,9 @@
 import os
 import argparse
+import copy
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mmcv
 import torch
@@ -8,6 +12,8 @@ from mmcv.parallel import collate, scatter
 from mmedit.apis import init_model
 from mmedit.core import tensor2img
 from mmedit.datasets.pipelines import Compose
+from adaint.config_utils import load_config
+from adaint.experiment_utils import inference_config, load_enhancer_checkpoint
 
 
 def enhancement_inference(model, img):
@@ -21,7 +27,10 @@ def enhancement_inference(model, img):
     cfg = model.cfg
     device = next(model.parameters()).device  # model device
     # remove gt from test_pipeline
-    keys_to_remove = ['gt', 'gt_path']
+    cfg.test_pipeline = copy.deepcopy(cfg.data.test.pipeline)
+    cfg.test_pipeline = [step for step in cfg.test_pipeline
+                         if step['type'] not in ('ResizeToMatch', 'ContextAwareAugment')]
+    keys_to_remove = ['gt', 'gt_path', 'mask_path']
     for key in keys_to_remove:
         for pipeline in list(cfg.test_pipeline):
             if 'key' in pipeline and key == pipeline['key']:
@@ -64,7 +73,9 @@ def main():
                          '"image_path".')
 
     model = init_model(
-        args.config, args.checkpoint, device=torch.device('cuda', args.device))
+        inference_config(load_config(args.config)), None,
+        device=torch.device('cuda', args.device))
+    load_enhancer_checkpoint(model, args.checkpoint)
 
     output = enhancement_inference(model, args.img_path)
     output = tensor2img(output)

@@ -8,6 +8,7 @@ import time
 import json
 import shutil
 import sys
+import subprocess
 
 # Prefer this checkout over any editable installation of the project.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -25,7 +26,7 @@ from mmedit.models import build_model
 from mmedit.utils import collect_env, get_root_logger
 from adaint.config_utils import load_config
 from adaint.experiment_utils import (
-    REFINEMENT_TYPES, inference_config, load_enhancer_checkpoint,
+    ENHANCER_TYPES, inference_config, load_enhancer_checkpoint,
     resolve_training_schedule, save_generation_configs, configure_epoch_display,
     select_best_checkpoint)
 
@@ -112,7 +113,7 @@ def infer_and_save_split(cfg, dataset_cfg, checkpoint_path, save_dir):
     infer_test_cfg['metrics'] = None
     model_cfg = inference_config(cfg).model
     model = build_model(model_cfg, train_cfg=None, test_cfg=infer_test_cfg)
-    if model_cfg.type in REFINEMENT_TYPES:
+    if model_cfg.type in ENHANCER_TYPES:
         load_enhancer_checkpoint(model, checkpoint_path)
     else:
         load_checkpoint(model, checkpoint_path, map_location='cpu')
@@ -148,7 +149,7 @@ def build_generation_config(base_cfg, gen, work_dir, args):
     cfg.resume_from = base_cfg.get('resume_from') if gen == args.start_gen else None
     if args.resume_from is not None and gen == args.start_gen:
         cfg.resume_from = args.resume_from
-    if cfg.resume_from and cfg.model.type in REFINEMENT_TYPES:
+    if cfg.resume_from and cfg.model.type in ENHANCER_TYPES:
         hooks = cfg.get('custom_hooks', [])
         if not any(hook['type'] == 'LUTResumeCounterHook' for hook in hooks):
             hooks.append(dict(type='LUTResumeCounterHook', priority='HIGHEST'))
@@ -165,9 +166,7 @@ def build_generation_config(base_cfg, gen, work_dir, args):
             model_path = osp.join(work_dir, f'gen_{gen-1}', 'best.pth')
             cfg.model.kd_loss = dict(
                 type='KD_Loss',
-                config_path=(osp.join(work_dir, f'gen_{gen-1}', 'inference_config.py')
-                             if osp.isfile(osp.join(work_dir, f'gen_{gen-1}', 'inference_config.py'))
-                             else cfg.teacher_config_path),
+                config_path=osp.join(work_dir, f'gen_{gen-1}', 'inference_config.py'),
                 model_path=model_path,
                 loss_type=cfg.kdloss_type,
                 loss_weight=cfg.kdloss_weight)
@@ -264,6 +263,11 @@ def main():
                 config=cfg.text,
             )
 
+        # Reject incompatible old architectures before MMCV's non-strict resume/load.
+        for checkpoint_path in (cfg.get('resume_from'), cfg.get('load_from')):
+            if checkpoint_path and cfg.model.type in ENHANCER_TYPES:
+                load_enhancer_checkpoint(model, checkpoint_path)
+
         # meta information
         meta = dict()
         if cfg.get('exp_name', None) is None:
@@ -272,6 +276,14 @@ def main():
         meta['mmedit Version'] = __version__
         meta['seed'] = args.seed
         meta['env_info'] = env_info
+        try:
+            meta['code_revision'] = subprocess.check_output(
+                ['git', 'rev-parse', 'HEAD'],
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                stderr=subprocess.DEVNULL).decode().strip()
+        except (OSError, subprocess.CalledProcessError):
+            meta['code_revision'] = 'unavailable'
+        cfg.checkpoint_config.meta['code_revision'] = meta['code_revision']
 
         # add an attribute for visualization convenience
         train_model(

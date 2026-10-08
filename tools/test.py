@@ -16,7 +16,7 @@ from mmedit.core.distributed_wrapper import DistributedDataParallelWrapper
 from mmedit.datasets import build_dataloader, build_dataset
 from mmedit.models import build_model
 from adaint.config_utils import load_config
-from adaint.experiment_utils import REFINEMENT_TYPES, load_enhancer_checkpoint
+from adaint.experiment_utils import ENHANCER_TYPES, load_enhancer_checkpoint
 
 
 def parse_args():
@@ -107,7 +107,7 @@ def main():
     args.save_image = args.save_path is not None
     empty_cache = cfg.get('empty_cache', False)
     if not distributed:
-        if cfg.model.type in REFINEMENT_TYPES:
+        if cfg.model.type in ENHANCER_TYPES:
             load_enhancer_checkpoint(model, args.checkpoint)
         else:
             load_checkpoint(model, args.checkpoint, map_location='cpu')
@@ -126,7 +126,7 @@ def main():
             find_unused_parameters=find_unused_parameters)
 
         device_id = torch.cuda.current_device()
-        if cfg.model.type in REFINEMENT_TYPES:
+        if cfg.model.type in ENHANCER_TYPES:
             load_enhancer_checkpoint(model.module, args.checkpoint)
         else:
             _ = load_checkpoint(

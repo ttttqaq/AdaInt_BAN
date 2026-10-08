@@ -12,7 +12,7 @@ from adaint.context_transform import configure_context_pipeline
 from adaint.dataset import PPR10KFolder
 from adaint.experiment_utils import inference_config, resolve_training_schedule
 from adaint.metrics_hc import _resize_mask, delta_e_hc, psnr_hc
-from adaint.model_refinement import AiLUTArchitectureV3
+from adaint.model import AiLUT
 from mmedit.core import delta_e, psnr
 from mmedit.datasets import build_dataloader, build_dataset
 from tools.prepare_lut_experiment import configure_ppr10k_data, prepare
@@ -93,10 +93,10 @@ def test_folder_split_discovers_all_images_and_checks_pairs(tmp_path):
 
 
 def test_ppr10k_config_preserves_provided_splits_metrics_and_expert():
-    with open('adaint/configs/ppr10k_refinement.yaml') as handle:
+    with open('adaint/configs/ppr10k.yaml') as handle:
         base = yaml.safe_load(handle)
     base = configure_ppr10k_data(base, '/dataset', 'c')
-    train, test = prepare(base, 'unit_ppr', 'all')
+    train, test = prepare(base, 'unit_ppr')
     assert train['data']['train']['dir_lq'] == '/dataset/prr_train/source'
     assert train['data']['val']['dir_lq'] == '/dataset/prr_value/source'
     assert train['data']['val']['dir_gt'] == '/dataset/prr_value/target_c'
@@ -109,7 +109,7 @@ def test_ppr10k_config_preserves_provided_splits_metrics_and_expert():
     cfg = mmcv.Config(train)
     cfg.gpus = 1
     resolve_training_schedule(cfg, 8875)
-    assert cfg.iters_per_epoch == 35 and cfg.total_iters == 3500
+    assert cfg.iters_per_epoch == 35 and cfg.total_iters == 10500
     assert inference_config(cfg).validation_test_cfg.metrics == expected
 
 
@@ -120,9 +120,8 @@ def test_ppr10k_full_context_pipeline_collates_different_image_shapes(tmp_path):
         image = np.full((*shape, 3), 100, np.uint8)
         for folder in ('source', 'target_a'):
             Image.fromarray(image).save(str(tmp_path/'prr_train'/folder/('1_{}.png'.format(index))))
-    cfg = load_config('adaint/configs/ppr10k_refinement.yaml')
+    cfg = load_config('adaint/configs/ppr10k.yaml')
     cfg = mmcv.Config(configure_ppr10k_data(cfg._cfg_dict, str(tmp_path), 'a'))
-    cfg.model.use_full_image_context = True
     configure_context_pipeline(cfg)
     context = next(step for step in cfg.data.train.pipeline if step['type'] == 'ContextAwareAugment')
     assert context['brightness'] == 0 and context['saturation'] == 0
@@ -139,12 +138,11 @@ def test_ppr10k_full_context_pipeline_collates_different_image_shapes(tmp_path):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='real AiLUT CUDA extension')
 def test_ppr10k_paired_model_evaluation_has_all_four_metrics(tmp_path):
-    model = AiLUTArchitectureV3(
-        n_vertices=9, coarse_vertices=5, curve_points=4,
+    model = AiLUT(
+        n_vertices=9, curve_points=4,
         stats_bins=8, stats_pool_size=16, condition_dim=32,
-        head_hidden_dim=16, vertex_embedding_dim=8,
-        guide_resolution=32, guide_channels=4,
-        use_interval_floor=False, use_flexible_tone_endpoints=False,
+        head_hidden_dim=16,
+        local_resolution=32, local_channels=4, context_size=32,
         test_cfg=mmcv.ConfigDict(metrics=['PSNR', 'deltaE', 'PSNR_hc', 'deltaE_hc'],
                                  crop_border=0)).cuda().eval()
     mask = tmp_path/'mask.png'

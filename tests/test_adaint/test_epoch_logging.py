@@ -14,13 +14,13 @@ from adaint.experiment_utils import (
 
 
 def test_epoch_only_config_resolves_runtime_and_exports_without_iteration_knobs(tmp_path):
-    cfg = load_config('adaint/configs/generated/ppr10ka_v3.yaml')
+    cfg = load_config('adaint/configs/ppr10k.yaml')
     assert 'total_iters' not in cfg and 'train_cfg' not in cfg
     assert 'interval' not in cfg.log_config and 'interval' not in cfg.evaluation
     cfg.gpus = 1
     resolve_training_schedule(cfg, 8875)
-    assert cfg.total_iters == 3500 and cfg.train_cfg.n_fix_iters == 175
-    assert cfg.checkpoint_config.interval == 35 and cfg.evaluation.interval == 175
+    assert cfg.total_iters == 10500 and cfg.train_cfg.n_fix_iters == 175
+    assert cfg.checkpoint_config.interval == 35 and cfg.evaluation.interval == 525
     assert cfg.log_config.interval == 35
     assert cfg.checkpoint_config.type == 'LUTEpochCheckpointHook'
     cfg.work_dir = str(tmp_path)
@@ -29,18 +29,18 @@ def test_epoch_only_config_resolves_runtime_and_exports_without_iteration_knobs(
     assert 'total_iters' not in saved and 'iters_per_epoch' not in saved
     assert 'interval' not in saved.log_config and 'interval' not in saved.checkpoint_config
     resolve_training_schedule(saved, 8875)
-    assert saved.total_iters == 3500 and saved.log_config.interval == 35
+    assert saved.total_iters == 10500 and saved.log_config.interval == 35
 
 
 def test_epoch_period_validation_and_batch_change_recompute_all_internal_steps():
-    cfg = load_config('adaint/configs/generated/ppr10ka_v3.yaml')
+    cfg = load_config('adaint/configs/ppr10k.yaml')
     cfg.gpus = 1
     cfg.data.train_dataloader.samples_per_gpu = 32
     cfg.log_interval_epochs = 2
     resolve_training_schedule(cfg, 8875)
     assert cfg.iters_per_epoch == 278
     assert cfg.log_config.interval == 556
-    assert cfg.total_iters == 27800 and cfg.evaluation.interval == 1390
+    assert cfg.total_iters == 83400 and cfg.evaluation.interval == 4170
     cfg.evaluation_interval_epochs = 3
     cfg.checkpoint_interval_epochs = 2
     with pytest.raises(ValueError, match='evaluation_interval_epochs'):
@@ -106,3 +106,11 @@ def test_epoch_checkpoint_name_and_existing_log_compatibility(tmp_path):
         dict(mode='val', epoch=2, PSNR=20.), dict(mode='val', iter=6, PSNR=21.)],
         str(tmp_path), steps_per_epoch=2)
     assert value == 21. and epoch == 3. and filename.endswith('iter_6.pth')
+
+
+def test_resume_uses_latest_validation_for_overwritten_checkpoint(tmp_path):
+    value, epoch, filename = select_best_checkpoint([
+        dict(mode='val', epoch=1, PSNR=20.),
+        dict(mode='val', epoch=2, PSNR=25.),
+        dict(mode='val', epoch=2, PSNR=19.)], str(tmp_path), steps_per_epoch=2)
+    assert value == 20. and epoch == 1 and filename.endswith('epoch_1.pth')

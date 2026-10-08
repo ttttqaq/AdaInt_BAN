@@ -5,7 +5,7 @@ from .model_refinement import (
     AiLUTRefinementBase, AiLUTArchitectureV3, AiLUTGlobalLocalV3)
 from .context_transform import ContextAwareAugment
 from .loss import KD_Loss
-from .dataset import FiveK, PPR10K, Face
+from .dataset import FiveK, PPR10K, PPR10KFolder, Face
 from .transforms import (
     RandomRatioCrop,
     ResizeToMatch,
@@ -17,6 +17,6 @@ __all__ = [
     'AiLUT', 'AiLUT_kd_unified', 'AiLUTArchitectureV2',
     'AiLUTRefinementBase', 'AiLUTArchitectureV3', 'AiLUTGlobalLocalV3',
     'ContextAwareAugment',
-    'FiveK', 'PPR10K', 'Face', 'KD_Loss',
+    'FiveK', 'PPR10K', 'PPR10KFolder', 'Face', 'KD_Loss',
     'RandomRatioCrop', 'ResizeToMatch', 'FlexibleRescaleToZeroOne',
     'RandomColorJitter', 'FlipChannels']

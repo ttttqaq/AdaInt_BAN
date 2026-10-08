@@ -1,0 +1,226 @@
+# A100 PNG export: use prr_train and the existing prr_value split.
+dataset: ppr10k
+data_root: /remote-home/share/yujietang/dataset/PRR10K
+target: a
+exp_name: ppr10ka_refinement_baseline
+custom_imports:
+  imports:
+    - adaint
+  allow_failed_imports: false
+
+# RefinementBase retains the V2 architecture. Select the fixed V3 architecture
+# using tools/prepare_lut_experiment.py --preset v3.
+# The architecture always uses color statistics, separate nonlinear heads,
+# a 1D-tone -> spatial residual-3D-LUT cascade, vertex-conditioned signed LUT
+# routing, and two spatial LUT branches. The switches below control only the
+# independent constraints around that architecture.
+#
+# For a single-factor ablation, copy this file, change one switch, and give
+# the copy a unique exp_name and work_dir. Also point teacher_config_path to
+# that copy so later generations build the same teacher model.
+# If enable_kd is false, gen: 1 is enough for a no-distillation baseline.
+gen: 4
+# The trainer resolves these from the actual dataset and batch size each run.
+train_epochs: 100
+adaint_fix_epochs: 5
+checkpoint_interval_epochs: 1
+evaluation_interval_epochs: 1
+log_interval_epochs: 1
+context_size: 256
+infer_after_generation: false
+enable_kd: true
+teacher_config_path: adaint/configs/ppr10k_refinement.yaml
+kdloss_type: L1Loss
+kdloss_weight: 1
+
+model:
+  type: AiLUTRefinementBase
+  n_ranks: 4
+  n_vertices: 33
+  coarse_vertices: 17
+  curve_points: 16
+
+  # Shared condition encoder and task-specific head sizes.
+  stats_bins: 16
+  stats_pool_size: 64
+  condition_dim: 256
+  head_hidden_dim: 128
+  vertex_embedding_dim: 64
+
+  # Spatial residual LUT cascade. This is part of the architecture, not an
+  # ablation switch. Raise n_spatial_luts only after validating the 2-LUT form.
+  n_spatial_luts: 2
+  guide_resolution: 128
+  guide_channels: 16
+  guide_temperature: 1.0
+
+  # Bounded signed low-rank LUT routing.
+  signed_weight_scale: 1.0
+  expert_init_scale: 0.01
+
+  # Independent constraint switches.
+  use_interval_floor: false
+  min_interval: 0.001
+  use_flexible_tone_endpoints: false
+  tone_endpoint_range: 0.05
+  # true: constrain only dR/dR, dG/dG, dB/dB;
+  # false: reproduce the legacy all-nine-partial-derivatives constraint.
+  use_diagonal_monotonicity: false
+  use_spatial_smoothness: true
+  spatial_smoothness_factor: 0.001
+
+  en_adaint: true
+  en_adaint_share: false
+  backbone: tpami
+  pretrained: false
+  n_colors: 3
+  sparse_factor: 0.0
+  smooth_factor: 0.0
+  monotonicity_factor: 2.0
+  recons_loss:
+    type: L1Loss
+    loss_weight: 1.0
+
+  # Independent methods; all off for the V2 architecture control.
+  use_stratified_statistics: false
+  use_kd_decay: false
+  kd_decay_start_ratio: 0.3
+  kd_decay_end_ratio: 1.0
+  kd_final_weight: 0.1
+  use_confidence_kd: false
+  confidence_temperature: 0.05
+  use_lab_loss: false
+  lab_loss_weight: 0.05
+  use_rgb_mse_loss: false
+  rgb_mse_loss_weight: 0.1
+  use_low_frequency_loss: false
+  low_frequency_loss_weight: 0.1
+  low_frequency_size: 32
+  use_edge_aware_smoothness: false
+  edge_smoothness_scale: 10.0
+  use_full_image_context: false
+
+test_cfg:
+  metrics:
+    - PSNR
+    - deltaE
+    - PSNR_hc
+    - deltaE_hc
+  crop_border: 0
+
+# Fixed-size training crops allow samples_per_gpu > 1, including full context.
+train_pipeline: &train_pipeline
+  - type: LoadImageFromFile
+    io_backend: disk
+    key: lq
+    backend: pillow
+    channel_order: rgb
+  - type: LoadImageFromFile
+    io_backend: disk
+    key: gt
+    backend: pillow
+    channel_order: rgb
+  - type: ResizeToMatch
+    keys: [lq]
+    reference_key: gt
+    interpolation: area
+  - type: RandomRatioCrop
+    keys: [lq, gt]
+    crop_ratio: [0.6, 1.0]
+  - type: Resize
+    keys: [lq, gt]
+    scale: [448, 448]
+    backend: cv2
+    interpolation: bilinear
+  - type: Flip
+    keys: [lq, gt]
+    flip_ratio: 0.5
+    direction: horizontal
+  - type: FlexibleRescaleToZeroOne
+    keys: [lq, gt]
+    precision: 32
+  - type: ImageToTensor
+    keys: [lq, gt]
+  - type: Collect
+    keys: [lq, gt]
+    meta_keys: [lq_path, gt_path]
+
+# Evaluate at the supplied 360p resolution, without crops or training resize.
+paired_test_pipeline: &paired_test_pipeline
+  - type: LoadImageFromFile
+    io_backend: disk
+    key: lq
+    backend: pillow
+    channel_order: rgb
+  - type: LoadImageFromFile
+    io_backend: disk
+    key: gt
+    backend: pillow
+    channel_order: rgb
+  - type: FlexibleRescaleToZeroOne
+    keys: [lq, gt]
+    precision: 32
+  - type: ImageToTensor
+    keys: [lq, gt]
+  - type: Collect
+    keys: [lq, gt]
+    meta_keys: [lq_path, gt_path, mask_path]
+
+data:
+  workers_per_gpu: 4
+  train_dataloader:
+    samples_per_gpu: 256
+  val_dataloader:
+    samples_per_gpu: 1
+  test_dataloader:
+    samples_per_gpu: 1
+    workers_per_gpu: 1
+  train:
+    type: PPR10KFolder
+    dir_lq: /remote-home/share/yujietang/dataset/PRR10K/prr_train/source
+    dir_gt: /remote-home/share/yujietang/dataset/PRR10K/prr_train/target_a
+    pipeline: *train_pipeline
+    test_mode: false
+  val: &validation_dataset
+    type: PPR10KFolder
+    dir_lq: /remote-home/share/yujietang/dataset/PRR10K/prr_value/source
+    dir_gt: /remote-home/share/yujietang/dataset/PRR10K/prr_value/target_a
+    dir_mask: /remote-home/share/yujietang/dataset/PRR10K/masks_360p
+    pipeline: *paired_test_pipeline
+    test_mode: true
+  # This is the same provided validation split, not a separate blind test set.
+  test: *validation_dataset
+
+optimizers:
+  type: Adam
+  lr: 0.0001
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  paramwise_cfg:
+    custom_keys:
+      adaint:
+        lr_mult: 0.1
+lr_config:
+  policy: CosineAnnealing
+  min_lr: 0.000001
+
+checkpoint_config:
+  save_optimizer: true
+evaluation:
+  save_image: false
+log_config:
+  hooks:
+    - type: LUTEpochTextLoggerHook
+visual_config: null
+
+dist_params:
+  backend: nccl
+log_level: INFO
+work_dir: ./work_dirs/ppr10ka_refinement_baseline
+load_from: null
+resume_from: null
+find_unused_parameters: true
+
+
+# Generate variants with --dataset ppr10k --target a/b/c.

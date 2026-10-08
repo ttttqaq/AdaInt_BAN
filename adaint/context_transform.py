@@ -79,8 +79,8 @@ def configure_context_pipeline(cfg):
                 context_size=cfg.get('context_size', 256),
                 samples_size=model.get('stats_pool_size', 64),
                 crop_ratio=crop['crop_ratio'], flip_ratio=flip.get('flip_ratio', 0.5),
-                brightness=jitter.get('brightness', 0.2),
-                saturation=jitter.get('saturation', 0.2)))
+                brightness=jitter.get('brightness', 0),
+                saturation=jitter.get('saturation', 0)))
         elif step['type'] not in ('Flip', 'RandomColorJitter'):
             step = dict(step)
             if step['type'] in ('FlexibleRescaleToZeroOne', 'ImageToTensor'):

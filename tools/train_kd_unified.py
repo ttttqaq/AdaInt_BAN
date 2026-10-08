@@ -26,7 +26,8 @@ from mmedit.utils import collect_env, get_root_logger
 from adaint.config_utils import load_config
 from adaint.experiment_utils import (
     REFINEMENT_TYPES, inference_config, load_enhancer_checkpoint,
-    resolve_training_schedule, save_generation_configs)
+    resolve_training_schedule, save_generation_configs, configure_epoch_display,
+    select_best_checkpoint)
 
 
 def parse_args():
@@ -227,6 +228,7 @@ def main():
 
         datasets = [build_dataset(cfg.data.train)]
         resolve_training_schedule(cfg, len(datasets[0]), distributed)
+        configure_epoch_display(logger, cfg)
         if not cfg.get('checkpoint_config') or not cfg.get('evaluation'):
             raise ValueError('generation training needs checkpoint and evaluation hooks')
         checkpoint_interval = cfg.checkpoint_config.interval
@@ -235,9 +237,17 @@ def main():
                 evaluation_interval % checkpoint_interval != 0):
             raise ValueError('evaluation interval must be a positive multiple of '
                              'checkpoint interval to select an existing best checkpoint')
-        logger.info('Resolved training budget: %s images, %s iters/generation, '
-                    '%s AdaInt freeze iters', len(datasets[0]), cfg.total_iters,
-                    cfg.train_cfg.get('n_fix_iters', 0))
+        if cfg.get('log_interval_epochs') is not None:
+            logger.info('Training schedule: %s images, %s epochs/generation, '
+                        'AdaInt fixed for %s epochs; save every %s epochs, '
+                        'evaluate every %s epochs, log every %s epochs',
+                        len(datasets[0]), cfg.train_epochs, cfg.adaint_fix_epochs,
+                        cfg.checkpoint_interval_epochs, cfg.evaluation_interval_epochs,
+                        cfg.log_interval_epochs)
+        else:
+            logger.info('Resolved training budget: %s images, %s iters/generation, '
+                        '%s AdaInt freeze iters', len(datasets[0]), cfg.total_iters,
+                        cfg.train_cfg.get('n_fix_iters', 0))
         save_generation_configs(cfg)
         model = build_model(
             cfg.model, train_cfg=cfg.train_cfg, test_cfg=cfg.test_cfg)
@@ -278,22 +288,15 @@ def main():
         for json_file_path in sorted(glob.glob(osp.join(cfg.work_dir, '*.log.json'))):
             with open(json_file_path) as file:
                 data_list.extend(json.loads(line) for line in file if line.strip())
-        # 找到所有mode为val的PSNR
-        val_psnr_list = [(entry['iter'], entry['PSNR'])
-                         for entry in data_list if entry.get('mode') == 'val']
-        if not val_psnr_list:
-            raise ValueError('no validation PSNR recorded; total_iters must reach '
-                             'the evaluation interval')
-
-        # 找到PSNR最大的iter
-        max_psnr_entry = max(val_psnr_list, key=lambda x: x[1])
-        max_iter = max_psnr_entry[0]
-        print(
-            f"gen: {gen}, PSNR最大时的iter：{max_psnr_entry[0]}, 对应的PSNR值：{max_psnr_entry[1]}")
+        epoch_steps = cfg.iters_per_epoch if cfg.get('log_interval_epochs') is not None else None
+        best_psnr, progress, source_file = select_best_checkpoint(
+            data_list, cfg.work_dir, epoch_steps)
+        unit = 'epoch' if epoch_steps else 'iter'
+        print('gen: {}, PSNR 最佳 {}: {:g}, PSNR: {}'.format(
+            gen, unit, progress, best_psnr))
 
         # 复制一份PSNR最大的checkpoint
         # 源文件路径
-        source_file = osp.join(cfg.work_dir, f'iter_{max_iter}.pth')
         # 目标文件路径
         destination_file = osp.join(cfg.work_dir, 'best.pth')
         shutil.copy(source_file, destination_file)

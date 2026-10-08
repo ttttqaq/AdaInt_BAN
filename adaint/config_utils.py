@@ -5,6 +5,18 @@ import os.path as osp
 import mmcv
 
 
+def _normalize_pipeline_scales(value):
+    """Old MMEditing Resize requires tuples, whereas YAML has only lists."""
+    if isinstance(value, dict):
+        if value.get('type') == 'Resize' and isinstance(value.get('scale'), list):
+            value['scale'] = tuple(value['scale'])
+        for child in value.values():
+            _normalize_pipeline_scales(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            _normalize_pipeline_scales(child)
+
+
 def load_config(filename):
     """Load the legacy Python config or a YAML config into ``mmcv.Config``.
 
@@ -35,6 +47,7 @@ def load_config(filename):
                 for item in cfg.workflow
             ]
 
+    _normalize_pipeline_scales(cfg._cfg_dict)
     custom_imports = cfg.get('custom_imports', None)
     if custom_imports:
         from mmcv.utils import import_modules_from_strings

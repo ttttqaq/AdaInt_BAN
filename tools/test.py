@@ -61,7 +61,10 @@ def main():
         if not cfg.data.get('val'):
             raise ValueError('--eval-val needs the saved inference_config.py with data.val')
         cfg.data.test = cfg.data.val
-        cfg.test_cfg = dict(metrics=['PSNR', 'deltaE'], crop_border=0)
+        paired_cfg = cfg.get('validation_test_cfg', cfg.get('test_cfg', {})) or {}
+        cfg.test_cfg = dict(paired_cfg)
+        cfg.test_cfg['metrics'] = paired_cfg.get('metrics') or ['PSNR', 'deltaE']
+        cfg.test_cfg.setdefault('crop_border', 0)
     # set cudnn_benchmark
     if cfg.get('cudnn_benchmark', False):
         torch.backends.cudnn.benchmark = True

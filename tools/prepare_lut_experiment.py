@@ -22,6 +22,27 @@ PRESETS = ['baseline', 'diagonal', 'kd_decay', 'confidence_kd', 'stratified',
            'v3', 'global_local', 'all']
 
 
+def configure_ppr10k_data(cfg, data_root=None, target=None):
+    """Use the supplied train/validation folders verbatim, for expert a/b/c."""
+    cfg = copy.deepcopy(cfg)
+    root = data_root or cfg['data_root']
+    target = target or cfg.get('target', 'a')
+    if target not in ('a', 'b', 'c'):
+        raise ValueError('PPR10K target must be a, b or c')
+    cfg['data_root'], cfg['target'] = root, target
+    for split in ('train', 'val', 'test'):
+        if split not in cfg['data']:
+            continue
+        dataset = cfg['data'][split]
+        folder = 'prr_train' if split == 'train' else 'prr_value'
+        dataset.update(type='PPR10KFolder',
+                       dir_lq=os.path.join(root, folder, 'source'),
+                       dir_gt=os.path.join(root, folder, 'target_' + target))
+        if split != 'train':
+            dataset['dir_mask'] = os.path.join(root, 'masks_360p')
+    return cfg
+
+
 def prepare(base, name, preset='baseline', architecture=None, enable=(),
             overrides=(), output_dir='adaint/configs/generated', generations=None,
             epochs=None):
@@ -69,10 +90,13 @@ def prepare(base, name, preset='baseline', architecture=None, enable=(),
     test['model'].pop('kd_loss', None)
     test['model'].pop('gen', None)
     test['train_cfg'] = None
+    test['validation_test_cfg'] = copy.deepcopy(cfg['test_cfg'])
     test['test_cfg'] = dict(metrics=None, crop_border=0)
     test['data'] = dict(workers_per_gpu=1,
                         test_dataloader=dict(samples_per_gpu=1, workers_per_gpu=1),
                         test=copy.deepcopy(cfg['data']['test']))
+    if 'val' in cfg['data']:
+        test['data']['val'] = copy.deepcopy(cfg['data']['val'])
     test['work_dir'] = cfg['work_dir'] + '/test'
     return cfg, test
 
@@ -86,11 +110,22 @@ def main():
     parser.add_argument('--set', nargs='*', default=[], metavar='KEY=VALUE')
     parser.add_argument('--gen', type=int)
     parser.add_argument('--epochs', type=int)
-    parser.add_argument('--base', default='adaint/configs/face_indoor_refinement.yaml')
+    parser.add_argument('--dataset', choices=['face', 'ppr10k'], default='face')
+    parser.add_argument('--target', choices=['a', 'b', 'c'],
+                        help='PPR10K groundtruth expert (default: a)')
+    parser.add_argument('--data-root', help='override the PPR10K dataset directory')
+    parser.add_argument('--base', help='override the selected dataset template')
     parser.add_argument('--output-dir', default='adaint/configs/generated')
     args = parser.parse_args()
-    with open(args.base) as handle:
+    base_path = args.base or ('adaint/configs/ppr10k_refinement.yaml'
+                             if args.dataset == 'ppr10k' else
+                             'adaint/configs/face_indoor_refinement.yaml')
+    with open(base_path) as handle:
         base = yaml.safe_load(handle)
+    if args.dataset == 'ppr10k' or base.get('dataset') == 'ppr10k':
+        base = configure_ppr10k_data(base, args.data_root, args.target)
+    elif args.target or args.data_root:
+        parser.error('--target and --data-root require a PPR10K template')
     cfg, test = prepare(base, args.name, args.preset, args.architecture,
                         args.enable, args.set, args.output_dir, args.gen, args.epochs)
     os.makedirs(args.output_dir, exist_ok=True)

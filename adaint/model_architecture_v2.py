@@ -15,6 +15,7 @@ from mmedit.models.registry import MODELS
 from mmedit.utils import get_root_logger
 
 from .model import Res18Backbone, TPAMIBackbone
+from .metrics_hc import delta_e_hc, psnr_hc
 
 
 class PredictionHead(nn.Module):
@@ -313,7 +314,8 @@ class SpatialGuide(nn.Module):
 class AiLUTArchitectureV2(BaseModel):
     """Statistics-conditioned, spatially adaptive cascaded LUT enhancer."""
 
-    allowed_metrics = {'PSNR': psnr, 'SSIM': ssim, 'deltaE': delta_e}
+    allowed_metrics = {'PSNR': psnr, 'SSIM': ssim, 'deltaE': delta_e,
+                       'PSNR_hc': psnr_hc, 'deltaE_hc': delta_e_hc}
 
     def __init__(self,
                  n_ranks=4,
@@ -518,29 +520,78 @@ class AiLUTArchitectureV2(BaseModel):
 
     def forward_test(self, lq, gt=None, meta=None, save_image=False,
                      save_path=None, iteration=None):
-        output, _, _ = self.forward_dummy(lq)
-        if self.test_cfg is not None and self.test_cfg.get('metrics', None):
-            if gt is None:
-                raise ValueError('evaluation with metrics requires gt images')
-            results = dict(eval_result=self.evaluate(output, gt))
-        else:
-            results = dict(lq=lq.cpu(), output=output.cpu())
-            if gt is not None:
-                results['gt'] = gt.cpu()
+        if isinstance(lq, (list, tuple)):
+            if not lq:
+                raise ValueError('evaluation batch must contain images')
+            if gt is not None and len(gt) != len(lq):
+                raise ValueError('evaluation requires one GT per input image')
+            if meta is not None and len(meta) != len(lq):
+                raise ValueError('evaluation requires one metadata entry per image')
 
-        if save_image:
-            lq_path = meta[0]['lq_path']
-            folder_name = osp.splitext(osp.basename(lq_path))[0]
-            if isinstance(iteration, numbers.Number):
-                save_path = osp.join(
-                    save_path, folder_name,
-                    '{}-{:06d}.png'.format(folder_name, iteration + 1))
-            elif iteration is None:
-                save_path = osp.join(save_path, '{}.png'.format(folder_name))
+            def image_tensor(image):
+                # MMCV's CPU scatter adds a singleton batch dimension.
+                if image.ndim == 4 and image.size(0) == 1:
+                    image = image[0]
+                if image.ndim != 3:
+                    raise ValueError('evaluation images must have CHW shape')
+                return image
+
+            images = [image_tensor(image) for image in lq]
+            targets = [image_tensor(image) for image in gt] if gt is not None else None
+            groups = {}
+            for index, image in enumerate(images):
+                if targets is not None and targets[index].shape != image.shape:
+                    raise ValueError('evaluation input and GT sizes must match')
+                groups.setdefault(tuple(image.shape), []).append(index)
+            results = [None] * len(images)
+            for indices in groups.values():
+                group_results = self.forward_test(
+                    torch.stack([images[index] for index in indices]),
+                    gt=(torch.stack([targets[index] for index in indices])
+                        if targets is not None else None),
+                    meta=([meta[index] for index in indices] if meta is not None else None),
+                    save_image=save_image, save_path=save_path, iteration=iteration)
+                if isinstance(group_results, dict):
+                    group_results = [group_results]
+                for index, result in zip(indices, group_results):
+                    results[index] = result
+            return results
+
+        if meta is not None and len(meta) != lq.size(0):
+            raise ValueError('evaluation requires one metadata entry per image')
+        if gt is not None and gt.shape != lq.shape:
+            raise ValueError('evaluation input and GT sizes must match')
+        output, _, _ = self.forward_dummy(lq)
+        results = []
+        for index in range(lq.size(0)):
+            sample_output = output[index:index + 1]
+            sample_gt = gt[index:index + 1] if gt is not None else None
+            sample_meta = meta[index:index + 1] if meta is not None else None
+            if self.test_cfg is not None and self.test_cfg.get('metrics', None):
+                if sample_gt is None:
+                    raise ValueError('evaluation with metrics requires gt images')
+                result = dict(eval_result=self.evaluate(
+                    sample_output, sample_gt, meta=sample_meta))
             else:
-                raise ValueError('iteration must be a number or None')
-            mmcv.imwrite(tensor2img(output), save_path)
-        return results
+                result = dict(lq=lq[index:index + 1].cpu(), output=sample_output.cpu())
+                if sample_gt is not None:
+                    result['gt'] = sample_gt.cpu()
+
+            if save_image:
+                if not sample_meta or not sample_meta[0].get('lq_path'):
+                    raise ValueError('saving evaluation images requires lq_path metadata')
+                folder_name = osp.splitext(osp.basename(sample_meta[0]['lq_path']))[0]
+                if isinstance(iteration, numbers.Number):
+                    image_path = osp.join(
+                        save_path, folder_name,
+                        '{}-{:06d}.png'.format(folder_name, iteration + 1))
+                elif iteration is None:
+                    image_path = osp.join(save_path, '{}.png'.format(folder_name))
+                else:
+                    raise ValueError('iteration must be a number or None')
+                mmcv.imwrite(tensor2img(sample_output), image_path)
+            results.append(result)
+        return results[0] if len(results) == 1 else results
 
     def train_step(self, data_batch, optimizer):
         if self.en_adaint and self.cnt_iters < self.n_fix_iters:
@@ -568,12 +619,23 @@ class AiLUTArchitectureV2(BaseModel):
     def val_step(self, data_batch, **kwargs):
         return self.forward_test(**data_batch, **kwargs)
 
-    def evaluate(self, output, gt):
+    def evaluate(self, output, gt, meta=None):
         crop_border = self.test_cfg.crop_border
         output = tensor2img(output)
         gt = tensor2img(gt)
+        mask = None
+        if any(metric in ('PSNR_hc', 'deltaE_hc') for metric in self.test_cfg.metrics):
+            if not meta or len(meta) != 1 or not meta[0].get('mask_path'):
+                raise ValueError('HC metrics require mask_path metadata for each image')
+            mask = mmcv.imread(meta[0]['mask_path'], flag='grayscale', backend='cv2')
+            if mask is None:
+                raise FileNotFoundError(meta[0]['mask_path'])
         eval_result = dict()
         for metric in self.test_cfg.metrics:
-            eval_result[metric] = self.allowed_metrics[metric](
-                output, gt, crop_border)
+            if metric in ('PSNR_hc', 'deltaE_hc'):
+                eval_result[metric] = self.allowed_metrics[metric](
+                    output, gt, mask, crop_border)
+            else:
+                eval_result[metric] = self.allowed_metrics[metric](
+                    output, gt, crop_border)
         return eval_result

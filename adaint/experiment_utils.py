@@ -1,12 +1,14 @@
 """Training budgets, inference configs and strict enhancer checkpoint loading."""
 import copy
 import math
+import numbers
 import os
 from pprint import pformat
 
 import torch
 from mmcv import Config
 from mmcv.runner import HOOKS, Hook, get_dist_info
+from .epoch_hooks import configure_epoch_display
 
 REFINEMENT_TYPES = ('AiLUTRefinementBase', 'AiLUTArchitectureV3', 'AiLUTGlobalLocalV3')
 
@@ -39,6 +41,7 @@ def resolve_training_schedule(cfg, dataset_size, distributed=False):
                      int(math.ceil(dataset_size / batch)))
         if steps < 1 or cfg.train_epochs < 1:
             raise ValueError('training schedule has no batches or epochs')
+        cfg.train_cfg = cfg.get('train_cfg') or {}
         cfg.total_iters = int(steps * cfg.train_epochs)
         cfg.train_cfg.n_fix_iters = int(steps * cfg.get('adaint_fix_epochs', 5))
         if cfg.get('checkpoint_config'):
@@ -46,13 +49,86 @@ def resolve_training_schedule(cfg, dataset_size, distributed=False):
         if cfg.get('evaluation'):
             cfg.evaluation.interval = int(steps * cfg.get('evaluation_interval_epochs', 1))
         cfg.iters_per_epoch = steps
+        if cfg.get('log_interval_epochs') is not None:
+            for key in ('train_epochs', 'adaint_fix_epochs', 'checkpoint_interval_epochs',
+                        'evaluation_interval_epochs', 'log_interval_epochs'):
+                value = cfg.get(key, 5 if key == 'adaint_fix_epochs' else 1)
+                minimum = 0 if key == 'adaint_fix_epochs' else 1
+                if isinstance(value, bool) or not isinstance(value, numbers.Integral) or value < minimum:
+                    raise ValueError('{} must be an integer >= {}'.format(key, minimum))
+            if cfg.evaluation_interval_epochs % cfg.checkpoint_interval_epochs:
+                raise ValueError('evaluation_interval_epochs must be a positive multiple '
+                                 'of checkpoint_interval_epochs')
+            if cfg.train_epochs < cfg.evaluation_interval_epochs:
+                raise ValueError('train_epochs must reach evaluation_interval_epochs')
+            cfg.workflow = cfg.get('workflow') or [('train', 1)]
+            if cfg.get('lr_config'):
+                cfg.lr_config.by_epoch = False
+            cfg.checkpoint_config.update(type='LUTEpochCheckpointHook', by_epoch=False,
+                                         steps_per_epoch=steps)
+            cfg.log_config.interval = steps * cfg.log_interval_epochs
+            for hook in cfg.log_config.hooks:
+                if hook['type'] in ('TextLoggerHook', 'LUTEpochTextLoggerHook'):
+                    hook.update(type='LUTEpochTextLoggerHook', by_epoch=False,
+                                steps_per_epoch=steps, total_epochs=cfg.train_epochs)
     if cfg.model.type in REFINEMENT_TYPES:
         cfg.train_cfg.total_iters = cfg.total_iters
     return cfg
 
 
+def public_training_config(cfg):
+    """Export epoch parameters without duplicating internal iteration values."""
+    result = Config(copy.deepcopy(cfg._cfg_dict))
+    if result.get('log_interval_epochs') is None:
+        return result
+    for key in ('total_iters', 'iters_per_epoch', 'workflow'):
+        result.pop(key, None)
+    if result.get('train_cfg') is not None:
+        for key in ('n_fix_iters', 'total_iters'):
+            result.train_cfg.pop(key, None)
+        if not result.train_cfg:
+            result.pop('train_cfg', None)
+    for key in ('checkpoint_config', 'log_config', 'evaluation'):
+        if result.get(key):
+            result[key].pop('interval', None)
+            result[key].pop('by_epoch', None)
+    if result.get('checkpoint_config'):
+        result.checkpoint_config.pop('steps_per_epoch', None)
+        if result.checkpoint_config.get('type') == 'LUTEpochCheckpointHook':
+            result.checkpoint_config.pop('type')
+    if result.get('lr_config'):
+        result.lr_config.pop('by_epoch', None)
+    for hook in result.get('log_config', {}).get('hooks', []):
+        for key in ('by_epoch', 'steps_per_epoch', 'total_epochs', 'interval'):
+            hook.pop(key, None)
+    return result
+
+
+def select_best_checkpoint(records, work_dir, steps_per_epoch=None):
+    """Read new epoch logs and existing iteration logs when resuming."""
+    candidates = []
+    for entry in records:
+        if entry.get('mode') != 'val' or 'PSNR' not in entry:
+            continue
+        if 'iter' in entry:
+            step = entry['iter']
+            progress = step / steps_per_epoch if steps_per_epoch else step
+            filename = 'iter_{}.pth'.format(step)
+        elif steps_per_epoch and 'epoch' in entry:
+            progress = entry['epoch']
+            filename = 'epoch_{}.pth'.format(entry['epoch'])
+        else:
+            continue
+        candidates.append((entry['PSNR'], progress, os.path.join(work_dir, filename)))
+    if not candidates:
+        raise ValueError('no validation PSNR recorded; training must reach its evaluation period')
+    return max(candidates, key=lambda item: item[0])
+
+
 def inference_config(cfg):
     result = Config(copy.deepcopy(cfg._cfg_dict))
+    result.validation_test_cfg = copy.deepcopy(
+        cfg.get('validation_test_cfg', cfg.get('test_cfg', {})))
     result.model.pop('kd_loss', None)
     result.model.pop('gen', None)
     result.train_cfg = None
@@ -78,8 +154,8 @@ def save_generation_configs(cfg):
         return value
 
     os.makedirs(cfg.work_dir, exist_ok=True)
-    for name, contents in (('resolved_config.py', cfg),
-                           ('inference_config.py', inference_config(cfg))):
+    for name, contents in (('resolved_config.py', public_training_config(cfg)),
+                           ('inference_config.py', public_training_config(inference_config(cfg)))):
         with open(os.path.join(cfg.work_dir, name), 'w') as handle:
             handle.write('\n\n'.join(
                 '{} = {}'.format(key, pformat(plain(value), width=100))

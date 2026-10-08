@@ -46,13 +46,16 @@ def single_gpu_test(model,
                 save_path=save_path,
                 iteration=iteration,
                 **data)
-        results.append(result)
-
-        # get batch size
-        for _, v in data.items():
-            if isinstance(v, torch.Tensor):
-                batch_size = v.size(0)
-                break
+        if isinstance(result, list):
+            results.extend(result)
+            batch_size = len(result)
+        else:
+            results.append(result)
+            # Legacy models return one dictionary for their tensor batch.
+            for _, v in data.items():
+                if isinstance(v, torch.Tensor):
+                    batch_size = v.size(0)
+                    break
         for _ in range(batch_size):
             prog_bar.update()
     return results
@@ -107,15 +110,18 @@ def multi_gpu_test(model,
                 save_path=save_path,
                 iteration=iteration,
                 **data)
-        results.append(result)
-        if empty_cache:
-            torch.cuda.empty_cache()
-        if rank == 0:
-            # get batch size
+        if isinstance(result, list):
+            results.extend(result)
+            batch_size = len(result)
+        else:
+            results.append(result)
             for _, v in data.items():
                 if isinstance(v, torch.Tensor):
                     batch_size = v.size(0)
                     break
+        if empty_cache:
+            torch.cuda.empty_cache()
+        if rank == 0:
             for _ in range(batch_size * world_size):
                 prog_bar.update()
     # collect results from all ranks

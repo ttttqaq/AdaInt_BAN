@@ -1,5 +1,9 @@
 import os.path as osp
 from collections import defaultdict
+from pathlib import Path
+
+import torch
+from mmcv.parallel import DataContainer
 
 from mmedit.datasets.registry import DATASETS
 from mmedit.datasets.base_dataset import BaseDataset
@@ -149,4 +153,70 @@ class PPR10K(BaseEnhanceDataset):
                         lq_path=osp.join(self.dir_lq, lq_name),
                         gt_path=osp.join(self.dir_gt, gt_name)))
         return data_infos
-    
+
+
+@DATASETS.register_module()
+class PPR10KFolder(BaseEnhanceDataset):
+    """Read an existing PPR10K split without creating another holdout split.
+
+    Sources and targets are matched by filename stem, allowing PNG exports
+    as well as the original TIFF files. Human masks are optional for training
+    and are carried as paths in validation metadata, never used as targets.
+    """
+
+    def __init__(self, dir_lq, dir_gt, pipeline, dir_mask=None,
+                 test_mode=False, ann_file=None):
+        BaseDataset.__init__(self, pipeline, test_mode=test_mode)
+        self.dir_lq = dir_lq
+        self.dir_gt = dir_gt
+        self.dir_mask = dir_mask
+        self.ann_file = ann_file
+        self.data_infos = self.load_annotations()
+
+    def prepare_test_data(self, idx):
+        data = super().prepare_test_data(idx)
+        # Validation keeps each image's native size. Collate into lists rather
+        # than padding/resizing portraits and landscapes into a shared canvas.
+        for key in ('lq', 'gt'):
+            if isinstance(data.get(key), torch.Tensor):
+                data[key] = DataContainer(data[key], stack=False)
+        return data
+
+    @staticmethod
+    def _images(directory):
+        directory = Path(directory)
+        if not directory.is_dir():
+            raise FileNotFoundError('image directory does not exist: {}'.format(directory))
+        images = {}
+        for path in sorted(directory.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in (
+                    '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'):
+                continue
+            if path.stem in images:
+                raise ValueError('duplicate image stem: {}'.format(path.stem))
+            images[path.stem] = str(path)
+        return images
+
+    def load_annotations(self):
+        sources = self._images(self.dir_lq)
+        targets = self._images(self.dir_gt)
+        masks = self._images(self.dir_mask) if self.dir_mask is not None else None
+        if self.ann_file is None:
+            names = sorted(sources)
+        else:
+            with open(self.ann_file) as handle:
+                names = [Path(line.strip()).stem for line in handle if line.strip()]
+        if not names:
+            raise ValueError('PPR10K split contains no images')
+        if len(names) != len(set(names)):
+            raise ValueError('PPR10K annotation contains duplicate images')
+        data_infos = []
+        for name in names:
+            for label, mapping in (('source', sources), ('target', targets), ('mask', masks)):
+                if mapping is not None and name not in mapping:
+                    raise FileNotFoundError('missing {} for PPR10K image {}'.format(label, name))
+            info = dict(lq_path=sources[name], gt_path=targets[name])
+            if masks is not None:
+                info['mask_path'] = masks[name]
+            data_infos.append(info)
+        return data_infos

@@ -6,13 +6,13 @@ custom_imports:
   imports:
   - adaint
   allow_failed_imports: false
-gen: 1
+gen: 4
 train_epochs: 300
 adaint_fix_epochs: 5
 checkpoint_interval_epochs: 1
 evaluation_interval_epochs: 15
 log_interval_epochs: 1
-infer_after_generation: false
+infer_after_generation: true
 enable_kd: false
 kdloss_type: MSELoss
 kdloss_weight: 0.1

@@ -1,4 +1,4 @@
-exp_name: v3_ready_kd
+exp_name: v3_ready_outdoor
 custom_imports:
   imports:
   - adaint
@@ -50,7 +50,7 @@ model:
     type: L1Loss
     loss_weight: 1.0
   use_stratified_statistics: true
-  use_kd_decay: true
+  use_kd_decay: false
   kd_decay_start_ratio: 0.3
   kd_decay_end_ratio: 1.0
   kd_final_weight: 0.5
@@ -186,18 +186,18 @@ data:
     workers_per_gpu: 1
   train:
     type: Face
-    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/all/1_indoors_data
-    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/all/1_indoors_data
-    ann_file: adaint/annfiles/Face/indoor_train.txt
+    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/all/2_outdoors_data
+    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/all/2_outdoors_data
+    ann_file: adaint/annfiles/Face/outdoor_train.txt
     pipeline: *id001
     test_mode: false
     filetmpl_lq: '{}_input.jpg'
     filetmpl_gt: '{}_gt.jpg'
   val:
     type: Face
-    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/all/1_indoors_data
-    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/all/1_indoors_data
-    ann_file: adaint/annfiles/Face/indoor_val.txt
+    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/all/2_outdoors_data
+    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/all/2_outdoors_data
+    ann_file: adaint/annfiles/Face/outdoor_val.txt
     pipeline: *id002
     test_mode: true
     filetmpl_lq: '{}_input.jpg'
@@ -244,7 +244,7 @@ visual_config: null
 dist_params:
   backend: nccl
 log_level: INFO
-work_dir: ./work_dirs/v3_ready_kd
+work_dir: ./work_dirs/v3_ready_outdoor
 load_from: null
 resume_from: null
 workflow:

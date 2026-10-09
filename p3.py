@@ -87,7 +87,7 @@ SUPPORTED_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp"}
 DEFAULT_INPUT_FOLDER = (
     Path(__file__).resolve().parent
     / "work_dirs"
-    / "v3_ready_1"
+    / "v3_ready_outdoor"
     / "gen_3"
     / "train_infer"
 )

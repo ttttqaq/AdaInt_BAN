@@ -1,9 +1,9 @@
-exp_name: face_outdoor_global_affine
+exp_name: face_indoor_p3_local_color
 custom_imports:
   imports:
   - adaint
   allow_failed_imports: false
-gen: 4
+gen: 1
 train_epochs: 100
 adaint_fix_epochs: 5
 checkpoint_interval_epochs: 1
@@ -35,13 +35,19 @@ model:
   local_magnitude_factor: 0.001
   local_smoothness_factor: 0.0001
   edge_smoothness_scale: 10.0
+  # RGB MSE + 0.01 * (0.75 * mean DeltaE + 0.25 * top-grid DeltaE) / 100.
+  color_loss_weight: 0.01
+  color_grid_size: 16
+  color_top_fraction: 0.1
+  color_hard_weight: 0.25
   kd_decay_start_ratio: 0.3
-  kd_decay_end_ratio: 1.0
+  kd_decay_end_ratio: 0.8
   kd_final_weight: 0.0
 test_cfg:
   metrics:
   - PSNR
-  - deltaE
+  - deltaE_P3
+  - deltaE_P3_top
   crop_border: 0
 train_pipeline:
 - type: LoadImageFromFile
@@ -154,9 +160,9 @@ data:
     workers_per_gpu: 1
   train:
     type: Face
-    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/all/2_outdoors_data
-    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/all/2_outdoors_data
-    ann_file: adaint/annfiles/Face/outdoor_train.txt
+    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/all/1_indoors_data
+    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/all/1_indoors_data
+    ann_file: adaint/annfiles/Face/indoor_train.txt
     pipeline:
     - type: LoadImageFromFile
       io_backend: disk
@@ -212,9 +218,9 @@ data:
     filetmpl_gt: '{}_gt.jpg'
   val:
     type: Face
-    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/all/2_outdoors_data
-    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/all/2_outdoors_data
-    ann_file: adaint/annfiles/Face/outdoor_val.txt
+    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/all/1_indoors_data
+    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/all/1_indoors_data
+    ann_file: adaint/annfiles/Face/indoor_val.txt
     pipeline:
     - type: LoadImageFromFile
       io_backend: disk
@@ -303,7 +309,7 @@ visual_config: null
 dist_params:
   backend: nccl
 log_level: INFO
-work_dir: ./work_dirs/face_outdoor_global_affine
+work_dir: ./work_dirs/face_indoor_p3_local_color
 load_from: null
 resume_from: null
 find_unused_parameters: true

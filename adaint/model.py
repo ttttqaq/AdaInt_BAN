@@ -15,6 +15,7 @@ from mmedit.models.registry import MODELS
 from mmedit.utils import get_root_logger
 
 from .backbones import TPAMIBackbone
+from .color import P3LabColorLoss
 from .metrics_hc import delta_e_hc, psnr_hc
 from .modules import (ColorStatistics, ConditionEncoder, ToneCurve,
                       AdaptiveIntervals, NormalizedResidualLUT, LocalAffineDecoder,
@@ -35,7 +36,9 @@ class AiLUT(BaseModel):
                  global_magnitude_factor=1e-5, local_magnitude_factor=0.001,
                  local_smoothness_factor=0.0001, edge_smoothness_scale=10.,
                  kd_decay_start_ratio=0.3, kd_decay_end_ratio=1.,
-                 kd_final_weight=0., gen=0, kd_loss=None,
+                 kd_final_weight=0., color_loss_weight=0., color_grid_size=16,
+                 color_top_fraction=0.1, color_hard_weight=0.25,
+                 gen=0, kd_loss=None,
                  train_cfg=None, test_cfg=None):
         super().__init__()
         if backbone.lower() != 'tpami' or pretrained:
@@ -79,6 +82,11 @@ class AiLUT(BaseModel):
         self.fp16_enabled = False
         self.register_buffer('cnt_iters', torch.zeros(1))
         self.recons_loss = build_loss(dict(type='MSELoss', loss_weight=1., reduction='mean'))
+        if not 0 <= color_loss_weight < float('inf'):
+            raise ValueError('color_loss_weight must be finite and non-negative')
+        self.color_loss_weight = float(color_loss_weight)
+        self.color_loss = P3LabColorLoss(color_grid_size, color_top_fraction,
+                                       color_hard_weight)
         self.kd_loss = build_loss(kd_loss) if self.gen > 0 and kd_loss is not None else None
         self.init_weights()
 
@@ -153,11 +161,16 @@ class AiLUT(BaseModel):
         output, weights, vertices, aux = self.forward_dummy(
             lq, True, lq_context, context_samples, crop_box)
         losses = dict(loss_recons=self.recons_loss(output, gt))
+        if self.color_loss_weight:
+            color, statistics = self.color_loss(output, gt)
+            losses['loss_color'] = self.color_loss_weight * color
+            losses.update(statistics)
         if self.kd_loss is not None:
             multiplier = self.kd_multiplier()
-            losses['loss_kd'] = multiplier*self.kd_loss(
+            losses['loss_kd'] = (multiplier*self.kd_loss(
                 output, lq, lq_context=lq_context,
                 context_samples=context_samples, crop_box=crop_box)
+                if multiplier > 0 else output.new_zeros(()))
             losses['kd_multiplier'] = output.new_tensor(multiplier)
         if self.smooth_factor or self.monotonicity_factor or self.global_magnitude_factor:
             smooth, mono, magnitude = lut_regularizations(aux['global_lut'], vertices)
@@ -283,6 +296,19 @@ class AiLUT(BaseModel):
 
     def evaluate(self, output, gt, meta=None):
         crop_border = self.test_cfg.crop_border
+        eval_result = dict()
+        color_metrics = {'deltaE_P3', 'deltaE_P3_top'}
+        if color_metrics.intersection(self.test_cfg.metrics):
+            # Evaluate the displayed gamut; train on the raw output without
+            # clamping. Keep floating-point RGB and avoid an 8-bit round trip.
+            pred, target = output.detach().clamp(0, 1), gt.detach().clamp(0, 1)
+            if crop_border:
+                pred = pred[..., crop_border:-crop_border, crop_border:-crop_border]
+                target = target[..., crop_border:-crop_border, crop_border:-crop_border]
+            mean, hard = self.color_loss.statistics(pred, target)
+            for metric, value in (('deltaE_P3', mean), ('deltaE_P3_top', hard)):
+                if metric in self.test_cfg.metrics:
+                    eval_result[metric] = value.mean().item()
         output = tensor2img(output)
         gt = tensor2img(gt)
         mask = None
@@ -292,8 +318,9 @@ class AiLUT(BaseModel):
             mask = mmcv.imread(meta[0]['mask_path'], flag='grayscale', backend='cv2')
             if mask is None:
                 raise FileNotFoundError(meta[0]['mask_path'])
-        eval_result = dict()
         for metric in self.test_cfg.metrics:
+            if metric in color_metrics:
+                continue
             if metric in ('PSNR_hc', 'deltaE_hc'):
                 eval_result[metric] = self.allowed_metrics[metric](
                     output, gt, mask, crop_border)

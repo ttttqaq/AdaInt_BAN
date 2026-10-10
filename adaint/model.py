@@ -38,6 +38,7 @@ class AiLUT(BaseModel):
                  kd_decay_start_ratio=0.3, kd_decay_end_ratio=1.,
                  kd_final_weight=0., color_loss_weight=0., color_grid_size=16,
                  color_top_fraction=0.1, color_hard_weight=0.25,
+                 color_hard_mode='lab', local_gain_mode='shared',
                  gen=0, kd_loss=None,
                  train_cfg=None, test_cfg=None):
         super().__init__()
@@ -58,7 +59,8 @@ class AiLUT(BaseModel):
         self.adaint = AdaptiveIntervals(n_vertices, condition_dim, head_hidden_dim, min_interval)
         self.lut_generator = NormalizedResidualLUT(n_vertices, n_ranks, condition_dim, head_hidden_dim)
         self.local_decoder = LocalAffineDecoder(condition_dim, local_resolution, local_channels,
-                                                guided_filter_radius, guided_filter_epsilon)
+                                                guided_filter_radius, guided_filter_epsilon,
+                                                local_gain_mode)
         self.n_vertices = int(n_vertices)
         self.context_size = int(context_size)
         # Used by the context-aware pipeline and frozen BAN teacher.
@@ -86,7 +88,7 @@ class AiLUT(BaseModel):
             raise ValueError('color_loss_weight must be finite and non-negative')
         self.color_loss_weight = float(color_loss_weight)
         self.color_loss = P3LabColorLoss(color_grid_size, color_top_fraction,
-                                       color_hard_weight)
+                                       color_hard_weight, color_hard_mode)
         self.kd_loss = build_loss(kd_loss) if self.gen > 0 and kd_loss is not None else None
         self.init_weights()
 
@@ -129,14 +131,13 @@ class AiLUT(BaseModel):
         global_output = ailut_transform(imgs, global_lut, vertices)
         low, slope, offset, low_source = self.local_decoder(source, condition)
         coefficients = self.local_decoder.upsample(slope, offset, imgs, crop_box)
-        raw_delta = coefficients[:, :1]*global_output+coefficients[:, 1:]
+        raw_delta = self.local_decoder.correction(coefficients, global_output)
         # Define the constant component on the SAME full-context quadrature
         # grid for crop training, validation, inference and frozen teachers.
         # This additional LUT query is small (default 64x64), not full-resolution.
         context_coefficients = self.local_decoder.upsample(slope, offset, low_source)
         context_global = ailut_transform(low_source, global_lut, vertices)
-        context_delta = (context_coefficients[:, :1]*context_global+
-                         context_coefficients[:, 1:])
+        context_delta = self.local_decoder.correction(context_coefficients, context_global)
         delta_mean = context_delta.mean((-1, -2), keepdim=True)
         local_delta = raw_delta-delta_mean
         output = global_output+local_delta
@@ -183,11 +184,8 @@ class AiLUT(BaseModel):
         if self.local_magnitude_factor:
             losses['loss_local_magnitude'] = self.local_magnitude_factor*aux['context_delta'].square().mean()
         if self.local_smoothness_factor:
-            smooth = output.new_zeros(())
-            for axis in (-1, -2):
-                difference = torch.diff(aux['low_coefficients'], dim=axis)
-                edge = torch.diff(aux['local_reference'], dim=axis).abs().mean(1, keepdim=True)
-                smooth = smooth+(difference.square()*torch.exp(-self.edge_smoothness_scale*edge)).mean()
+            smooth = self.local_decoder.smoothness(
+                aux['low_coefficients'], aux['local_reference'], self.edge_smoothness_scale)
             losses['loss_local_smooth'] = self.local_smoothness_factor*smooth
         losses.update(
             lut_weight_abs_mean=weights.detach().abs().mean(),
@@ -297,7 +295,8 @@ class AiLUT(BaseModel):
     def evaluate(self, output, gt, meta=None):
         crop_border = self.test_cfg.crop_border
         eval_result = dict()
-        color_metrics = {'deltaE_P3', 'deltaE_P3_top'}
+        color_metrics = {'deltaE_P3', 'deltaE_P3_top', 'chroma_P3', 'chroma_P3_top',
+                         'chroma_P3_p90', 'L_error_P3'}
         if color_metrics.intersection(self.test_cfg.metrics):
             # Evaluate the displayed gamut; train on the raw output without
             # clamping. Keep floating-point RGB and avoid an 8-bit round trip.
@@ -305,8 +304,7 @@ class AiLUT(BaseModel):
             if crop_border:
                 pred = pred[..., crop_border:-crop_border, crop_border:-crop_border]
                 target = target[..., crop_border:-crop_border, crop_border:-crop_border]
-            mean, hard = self.color_loss.statistics(pred, target)
-            for metric, value in (('deltaE_P3', mean), ('deltaE_P3_top', hard)):
+            for metric, value in self.color_loss.evaluation_statistics(pred, target).items():
                 if metric in self.test_cfg.metrics:
                     eval_result[metric] = value.mean().item()
         output = tensor2img(output)

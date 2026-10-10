@@ -84,7 +84,7 @@ def test_opposite_color_errors_do_not_cancel_and_difficult_cells_get_more_gradie
 def test_single_generation_configs_and_optional_kd_reaches_zero(scene, count):
     cfg = load_config('adaint/configs/face_{}.yaml'.format(scene))
     assert cfg.gen == 1 and not cfg.enable_kd
-    assert cfg.model.color_loss_weight == .01
+    assert cfg.model.color_loss_weight == (.3 if scene == 'indoor' else .1)
     assert cfg.test_cfg.metrics == ['PSNR', 'deltaE_P3', 'deltaE_P3_top']
     assert scene + '_train.txt' in cfg.data.train.ann_file
     cfg.gpus = 1

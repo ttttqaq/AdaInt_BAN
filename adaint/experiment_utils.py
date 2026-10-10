@@ -104,11 +104,22 @@ def public_training_config(cfg):
     return result
 
 
-def select_best_checkpoint(records, work_dir, steps_per_epoch=None):
-    """Read new epoch logs and existing iteration logs when resuming."""
+def select_best_checkpoint(records, work_dir, steps_per_epoch=None,
+                           metric='PSNR', psnr_tolerance=None):
+    """Select on validation only, optionally within final best-PSNR tolerance.
+
+    PSNR/SSIM are maximized; color distances are minimized. The constraint
+    is applied AFTER the entire history is read, so a late PSNR improvement
+    cannot leave an earlier, now ineligible color checkpoint selected.
+    """
+    if psnr_tolerance is not None and (not math.isfinite(psnr_tolerance) or psnr_tolerance < 0):
+        raise ValueError('psnr_tolerance must be finite and non-negative')
+    if metric not in ('PSNR', 'SSIM', 'deltaE_P3', 'deltaE_P3_top',
+                      'chroma_P3', 'chroma_P3_top', 'chroma_P3_p90', 'L_error_P3'):
+        raise ValueError('unsupported checkpoint selection metric: ' + metric)
     candidates = {}
     for entry in records:
-        if entry.get('mode') != 'val' or 'PSNR' not in entry:
+        if entry.get('mode') != 'val':
             continue
         if 'iter' in entry:
             step = entry['iter']
@@ -121,10 +132,19 @@ def select_best_checkpoint(records, work_dir, steps_per_epoch=None):
             continue
         # A resumed run can overwrite the same epoch/iteration file. Retain
         # its latest validation, otherwise an older score can describe new weights.
-        candidates[filename] = (entry['PSNR'], progress, os.path.join(work_dir, filename))
-    if not candidates:
+        candidates[filename] = (entry, progress, os.path.join(work_dir, filename))
+    scored = [(entry, progress, path) for entry, progress, path in candidates.values()
+              if 'PSNR' in entry and math.isfinite(entry['PSNR'])]
+    if not scored:
         raise ValueError('no validation PSNR recorded; training must reach its evaluation period')
-    return max(candidates.values(), key=lambda item: item[0])
+    best_psnr = max(entry['PSNR'] for entry, _, _ in scored)
+    eligible = [(entry[metric], progress, path) for entry, progress, path in scored
+                if metric in entry and math.isfinite(entry[metric]) and
+                (psnr_tolerance is None or entry['PSNR'] >= best_psnr - psnr_tolerance)]
+    if not eligible:
+        raise ValueError('no eligible validation checkpoint for metric ' + metric)
+    choose = max if metric in ('PSNR', 'SSIM') else min
+    return choose(eligible, key=lambda item: item[0])
 
 
 def inference_config(cfg):
@@ -164,8 +184,8 @@ def save_generation_configs(cfg):
                 for key, value in contents._cfg_dict.items()) + '\n')
 
 
-def load_enhancer_checkpoint(model, filename):
-    """Discard frozen teacher weights, but reject every enhancer shape/key mismatch."""
+def load_enhancer_checkpoint(model, filename, allow_gain_migration=True):
+    """Strict loading, with the single exact shared-gain -> RGB-gain migration."""
     checkpoint = torch.load(filename, map_location='cpu')
     state = checkpoint.get('state_dict', checkpoint)
     state = {key[7:] if key.startswith('module.') else key: value
@@ -175,6 +195,13 @@ def load_enhancer_checkpoint(model, filename):
     current = model.state_dict()
     expected = {key: value for key, value in current.items()
                 if not key.startswith('kd_loss.')}
+    head = 'local_decoder.output.weight'
+    if (head in state and head in expected and expected[head].size(0) == 6 and
+            state[head].shape == (4,) + expected[head].shape[1:]):
+        if not allow_gain_migration:
+            raise RuntimeError('4 -> 6 gain migration needs load_from, not resume_from: '
+                               'the old optimizer state has a different shape')
+        state[head] = torch.cat((state[head][:1].repeat(3, 1, 1, 1), state[head][1:]), 0)
     missing = sorted(set(expected)-set(state))
     unexpected = sorted(set(state)-set(expected))
     shapes = sorted(key for key in set(state) & set(expected)

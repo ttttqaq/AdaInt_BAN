@@ -229,16 +229,19 @@ def lut_regularizations(lut, vertices):
 
 
 class LocalAffineDecoder(nn.Module):
-    """Multiscale FiLM-conditioned four-coefficient local correction.
+    """Multiscale FiLM-conditioned shared- or RGB-gain local correction.
 
     Filter a full-context field before cropping; high-resolution guidance is
     per-pixel luminance, so crops use the same coordinate system as inference.
     """
     def __init__(self, condition_dim, resolution=128, channels=16,
-                 radius=2, epsilon=0.001):
+                 radius=2, epsilon=0.001, gain_mode='shared'):
         super().__init__()
         if resolution < 32 or channels < 4 or radius < 1 or epsilon <= 0:
             raise ValueError('invalid local decoder or guided-filter settings')
+        if gain_mode not in ('shared', 'rgb'):
+            raise ValueError('local_gain_mode must be shared or rgb')
+        self.gain_channels = 1 if gain_mode == 'shared' else 3
         self.resolution, self.radius, self.epsilon = int(resolution), int(radius), float(epsilon)
         self.shallow = nn.Sequential(nn.Conv2d(3, channels, 3, 2, 1), nn.LeakyReLU(.2))
         self.deep = nn.Sequential(
@@ -249,8 +252,37 @@ class LocalAffineDecoder(nn.Module):
         self.film = nn.Linear(condition_dim, channels*4)
         nn.init.zeros_(self.film.weight)
         nn.init.zeros_(self.film.bias)
-        self.output = nn.Conv2d(channels*2, 4, 1, bias=False)
+        self.output = nn.Conv2d(channels*2, self.gain_channels + 3, 1, bias=False)
         nn.init.zeros_(self.output.weight)
+
+    def correction(self, coefficients, global_output):
+        return (coefficients[:, :self.gain_channels] * global_output +
+                coefficients[:, self.gain_channels:])
+
+    def smoothness(self, coefficients, reference, edge_scale):
+        result = coefficients.new_zeros(())
+        for axis in (-1, -2):
+            difference = torch.diff(coefficients, dim=axis)
+            edge = torch.diff(reference, dim=axis).abs().mean(1, keepdim=True)
+            penalty = difference.square() * torch.exp(-edge_scale * edge)
+            if self.gain_channels == 1:
+                result = result + penalty.mean()
+            else:
+                # Match the old 1 gain : 3 offsets weighting. Copying a shared
+                # gain into RGB must leave the regularization strength unchanged.
+                result = result + .25 * penalty[:, :3].mean() + .75 * penalty[:, 3:].mean()
+        return result
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        key = prefix + 'output.weight'
+        weight = state_dict.get(key)
+        if (self.gain_channels == 3 and weight is not None and
+                weight.shape == (4,) + self.output.weight.shape[1:]):
+            # Exact 4 -> 6 migration, including MMCV load_from/inference loaders.
+            state_dict[key] = torch.cat((weight[:1].repeat(3, 1, 1, 1), weight[1:]), 0)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                     missing_keys, unexpected_keys, error_msgs)
 
     def box_mean(self, value):
         return F.avg_pool2d(value, 2*self.radius+1, stride=1,

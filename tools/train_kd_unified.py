@@ -230,6 +230,19 @@ def main():
         configure_epoch_display(logger, cfg)
         if not cfg.get('checkpoint_config') or not cfg.get('evaluation'):
             raise ValueError('generation training needs checkpoint and evaluation hooks')
+        selection = cfg.get('checkpoint_selection')
+        if selection:
+            metric = selection.get('metric', 'chroma_P3_top')
+            if metric not in cfg.test_cfg.get('metrics', []):
+                raise ValueError('checkpoint selection metric must be enabled in test_cfg.metrics')
+            if cfg.checkpoint_config.get('max_keep_ckpts', -1) > 0:
+                raise ValueError('color selection requires retaining all evaluated checkpoints')
+            # Validate the policy before training, rather than after 100 epochs.
+            policy_record = dict(mode='val', epoch=1, PSNR=0.)
+            policy_record[metric] = 0.
+            select_best_checkpoint([policy_record],
+                                   cfg.work_dir, 1, metric,
+                                   selection.get('psnr_tolerance', .1))
         checkpoint_interval = cfg.checkpoint_config.interval
         evaluation_interval = cfg.evaluation.interval
         if (checkpoint_interval < 1 or evaluation_interval < 1 or
@@ -266,7 +279,8 @@ def main():
         # Reject incompatible old architectures before MMCV's non-strict resume/load.
         for checkpoint_path in (cfg.get('resume_from'), cfg.get('load_from')):
             if checkpoint_path and cfg.model.type in ENHANCER_TYPES:
-                load_enhancer_checkpoint(model, checkpoint_path)
+                load_enhancer_checkpoint(model, checkpoint_path,
+                    allow_gain_migration=checkpoint_path != cfg.get('resume_from'))
 
         # meta information
         meta = dict()
@@ -295,36 +309,55 @@ def main():
             timestamp=timestamp,
             meta=meta)
 
-        # Include this generation's earlier validation history after a resume.
-        data_list = []
-        for json_file_path in sorted(glob.glob(osp.join(cfg.work_dir, '*.log.json'))):
-            with open(json_file_path) as file:
-                data_list.extend(json.loads(line) for line in file if line.strip())
-        epoch_steps = cfg.iters_per_epoch if cfg.get('log_interval_epochs') is not None else None
-        best_psnr, progress, source_file = select_best_checkpoint(
-            data_list, cfg.work_dir, epoch_steps)
-        unit = 'epoch' if epoch_steps else 'iter'
-        print('gen: {}, PSNR 最佳 {}: {:g}, PSNR: {}'.format(
-            gen, unit, progress, best_psnr))
-
-        # 复制一份PSNR最大的checkpoint
-        # 源文件路径
-        # 目标文件路径
-        destination_file = osp.join(cfg.work_dir, 'best.pth')
-        shutil.copy(source_file, destination_file)
-
-        # 用刚生成的 best.pth 对本代的训练集 + 验证集全部图片跑一遍推理（每张
-        # 图都在其原图满分辨率上跑，不做 ResizeToMatch/裁剪），结果图片保存在
-        # 同一个 work_dir（即 work_dirs/{exp_name}/gen_{gen}）下的 train_infer/
-        # 子目录，文件名为 {id}_result.png。分布式训练时只在 rank 0 上跑一次，
-        # 避免重复推理。
         rank, _ = get_dist_info()
+        # Only rank zero writes checkpoint aliases and the selection record.
+        if not distributed or rank == 0:
+            export_best_checkpoints(cfg)
+        if distributed:
+            torch.distributed.barrier()
+        destination_file = osp.join(cfg.work_dir, 'best.pth')
         if cfg.get('infer_after_generation', True) and (not distributed or rank == 0):
             infer_save_dir = osp.join(cfg.work_dir, 'train_infer')
             infer_and_save_split(cfg, cfg.data.train, destination_file, infer_save_dir)
             infer_and_save_split(cfg, cfg.data.val, destination_file, infer_save_dir)
             print(f"gen: {gen}, 已用 best.pth 对训练集+验证集全部图片"
                  f"（满分辨率）推理完毕，结果保存在 {infer_save_dir}")
+
+
+def export_best_checkpoints(cfg):
+    """Keep PSNR/color winners and choose inference weights under a PSNR bound."""
+    records = []
+    for path in sorted(glob.glob(osp.join(cfg.work_dir, '*.log.json'))):
+        with open(path) as handle:
+            records.extend(json.loads(line) for line in handle if line.strip())
+    steps = cfg.iters_per_epoch if cfg.get('log_interval_epochs') is not None else None
+    psnr = select_best_checkpoint(records, cfg.work_dir, steps)
+    selection = cfg.get('checkpoint_selection')
+    choices = {'best_psnr.pth': psnr}
+    if selection:
+        metric = selection.get('metric', 'chroma_P3_top')
+        tolerance = selection.get('psnr_tolerance', .1)
+        choices['best_color.pth'] = select_best_checkpoint(
+            records, cfg.work_dir, steps, metric=metric)
+        choices['best.pth'] = select_best_checkpoint(
+            records, cfg.work_dir, steps, metric=metric, psnr_tolerance=tolerance)
+    else:
+        metric, tolerance = 'PSNR', None
+        choices['best.pth'] = psnr
+    # Check all sources before writing any aliases.
+    for _, _, source in choices.values():
+        if not osp.isfile(source):
+            raise FileNotFoundError('selected checkpoint is missing: ' + source)
+    summary = dict(metric=metric, psnr_tolerance=tolerance, best_psnr=psnr[0],
+                   checkpoints={})
+    for name, (value, progress, source) in choices.items():
+        shutil.copyfile(source, osp.join(cfg.work_dir, name))
+        summary['checkpoints'][name] = dict(source=osp.basename(source),
+                                           progress=progress, score=value)
+    with open(osp.join(cfg.work_dir, 'checkpoint_selection.json'), 'w') as handle:
+        json.dump(summary, handle, indent=2)
+    print('Checkpoint selection: ' + json.dumps(summary))
+    return summary
 
 
 if __name__ == '__main__':

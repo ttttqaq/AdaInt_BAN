@@ -44,14 +44,22 @@ def display_p3_to_lab(rgb):
 
 def p3_delta_e_map(pred, target, epsilon=0.):
     """Per-pixel Delta E 76 in Lab units, optionally smoothed at equality."""
+    _, error, _ = p3_error_maps(pred, target, epsilon)
+    return error
+
+
+def p3_error_maps(pred, target, epsilon=0.):
+    """Compute distances per pixel BEFORE pooling, to avoid color cancellation."""
     if pred.shape != target.shape:
         raise ValueError('color supervision requires aligned prediction and GT')
     difference = display_p3_to_lab(pred) - display_p3_to_lab(target)
-    return (difference.square().sum(1) + epsilon ** 2).sqrt() - epsilon
+    lab = (difference.square().sum(1) + epsilon ** 2).sqrt() - epsilon
+    ab = (difference[:, 1:].square().sum(1) + epsilon ** 2).sqrt() - epsilon
+    return difference, lab, ab
 
 
-def grid_top_mean(error_map, grid_size=16, top_fraction=0.1):
-    """Per-image mean of the worst q non-overlapping rectangular grid cells.
+def grid_cell_means(error_map, grid_size=16):
+    """Per-image means of non-overlapping rectangular grid cells.
 
     Partition the actual paired crop, not the full-image context. Uneven
     dimensions are split at floor(i * size / count); every pixel belongs to
@@ -67,31 +75,68 @@ def grid_top_mean(error_map, grid_size=16, top_fraction=0.1):
                              torch.split(error_map, row_sizes, dim=-2)], dim=-2)
     cells = torch.stack([part.mean(-1) for part in
                          torch.split(row_means, col_sizes, dim=-1)], dim=-1)
-    count = max(1, math.ceil(rows * columns * top_fraction))
-    return cells.flatten(1).topk(count, dim=1).values.mean(1)
+    return cells.flatten(1)
+
+
+def grid_top_mean(error_map, grid_size=16, top_fraction=0.1):
+    cells = grid_cell_means(error_map, grid_size)
+    count = max(1, math.ceil(cells.size(1) * top_fraction))
+    return cells.topk(count, dim=1).values.mean(1)
 
 
 class P3LabColorLoss(nn.Module):
     """Global color distance plus a modest worst-grid term, normalized by 100."""
-    def __init__(self, grid_size=16, top_fraction=0.1, hard_weight=0.25):
+    def __init__(self, grid_size=16, top_fraction=0.1, hard_weight=0.25,
+                 hard_mode='lab'):
         super().__init__()
         if (isinstance(grid_size, bool) or
                 not isinstance(grid_size, numbers.Integral) or grid_size < 1):
             raise ValueError('color_grid_size must be a positive integer')
         if not 0 < top_fraction <= 1 or not 0 <= hard_weight <= 1:
             raise ValueError('invalid color top fraction or hard-region weight')
+        if hard_mode not in ('lab', 'ab'):
+            raise ValueError('color_hard_mode must be lab or ab')
         self.grid_size = int(grid_size)
         self.top_fraction = float(top_fraction)
         self.hard_weight = float(hard_weight)
+        self.hard_mode = hard_mode
 
     def statistics(self, pred, target, epsilon=0.):
+        # Preserve the meaning of the existing deltaE_P3_top metric in all modes.
         error = p3_delta_e_map(pred, target, epsilon)
         mean = error.mean((-1, -2))
         hard = grid_top_mean(error, self.grid_size, self.top_fraction)
         return mean, hard
 
+    def evaluation_statistics(self, pred, target):
+        difference, lab, ab = p3_error_maps(pred, target)
+        return dict(deltaE_P3=lab.mean((-1, -2)),
+                    deltaE_P3_top=grid_top_mean(lab, self.grid_size, self.top_fraction),
+                    chroma_P3=ab.mean((-1, -2)),
+                    chroma_P3_top=grid_top_mean(ab, self.grid_size, self.top_fraction),
+                    chroma_P3_p90=torch.quantile(ab.flatten(1), .9, dim=1),
+                    L_error_P3=difference[:, 0].abs().mean((-1, -2)))
+
     def forward(self, pred, target):
-        mean, hard = self.statistics(pred, target, epsilon=1e-3)
+        difference, lab, ab = p3_error_maps(pred, target, epsilon=1e-3)
+        mean = lab.mean((-1, -2))
+        error = ab if self.hard_mode == 'ab' else lab
+        cells = grid_cell_means(error, self.grid_size)
+        count = max(1, math.ceil(cells.size(1) * self.top_fraction))
+        selected = cells.topk(count, dim=1)
+        hard = selected.values.mean(1)
         loss = ((1. - self.hard_weight) * mean + self.hard_weight * hard).mean() / 100.
+        # Inspect the selected training grids without adding another objective.
+        with torch.no_grad():
+            light = grid_cell_means(difference[:, 0].square(), self.grid_size)
+            chroma = grid_cell_means(difference[:, 1:].square().sum(1), self.grid_size)
+            light = light.gather(1, selected.indices).mean(1)
+            chroma = chroma.gather(1, selected.indices).mean(1)
+            light_fraction = light / (light + chroma).clamp_min(1e-12)
         return loss, dict(color_delta_e=mean.detach().mean(),
-                          color_delta_e_top=hard.detach().mean())
+                          color_delta_e_top=grid_top_mean(lab.detach(), self.grid_size,
+                                                         self.top_fraction).mean(),
+                          color_chroma=ab.detach().mean(),
+                          color_chroma_top=grid_top_mean(ab.detach(), self.grid_size,
+                                                        self.top_fraction).mean(),
+                          color_hard_L_fraction=light_fraction.mean())

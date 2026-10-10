@@ -87,8 +87,8 @@ SUPPORTED_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp"}
 DEFAULT_INPUT_FOLDER = (
     Path(__file__).resolve().parent
     / "work_dirs"
-    / "face_indoor_global_affine_2"
-    / "gen_3"
+    / "face_indoor_p3_local_color_1"
+    / "gen_0"
     / "train_infer"
 )
 DEFAULT_OUTPUT_FOLDER = DEFAULT_INPUT_FOLDER.with_name("train_infer_p3")

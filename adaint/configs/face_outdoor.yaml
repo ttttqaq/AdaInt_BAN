@@ -36,7 +36,7 @@ model:
   local_smoothness_factor: 0.0001
   edge_smoothness_scale: 10.0
   # RGB MSE + 0.01 * (0.75 * mean DeltaE + 0.25 * top-grid DeltaE) / 100.
-  color_loss_weight: 0.01
+  color_loss_weight: 0.1
   color_grid_size: 16
   color_top_fraction: 0.1
   color_hard_weight: 0.25

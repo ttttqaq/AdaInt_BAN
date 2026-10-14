@@ -54,4 +54,6 @@ def load_config(filename):
         import_modules_from_strings(**custom_imports)
     from .context_transform import configure_context_pipeline
     configure_context_pipeline(cfg)
+    from .semantic_pipeline import configure_semantic_pipeline
+    configure_semantic_pipeline(cfg)
     return cfg

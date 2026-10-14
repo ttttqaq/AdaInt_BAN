@@ -94,6 +94,18 @@ def infer_and_save_split(cfg, dataset_cfg, checkpoint_path, save_dir):
         dict(type='ImageToTensor', keys=['lq']),
         dict(type='Collect', keys=['lq'], meta_keys=['lq_path']),
     ]
+    if cfg.model.type == 'AiLUTDual':
+        from adaint.semantic_pipeline import semantic_mask_step
+        split = 'train' if dataset_cfg.ann_file == cfg.data.train.ann_file else 'val'
+        step = semantic_mask_step(cfg, split, training=False)
+        full_res_pipeline.insert(1, step)
+        mask_keys = ['foreground_mask', 'supervision_mask']
+        if step.get('face_root'):
+            mask_keys.append('face_mask')
+        for transform in full_res_pipeline:
+            if transform['type'] in ('FlexibleRescaleToZeroOne', 'ImageToTensor', 'Collect'):
+                transform['keys'] = list(transform['keys']) + mask_keys
+        full_res_pipeline[-1]['meta_keys'].append('foreground_mask_path')
     infer_cfg = copy.deepcopy(dataset_cfg)
     infer_cfg.pipeline = full_res_pipeline
     infer_cfg.test_mode = True
@@ -103,6 +115,7 @@ def infer_and_save_split(cfg, dataset_cfg, checkpoint_path, save_dir):
         dataset,
         samples_per_gpu=1,
         workers_per_gpu=cfg.data.get('workers_per_gpu', 1),
+        persistent_workers=cfg.data.get('workers_per_gpu', 1) > 0,
         dist=False,
         shuffle=False)
 
@@ -301,13 +314,15 @@ def main():
             with open(json_file_path) as file:
                 data_list.extend(json.loads(line) for line in file if line.strip())
         epoch_steps = cfg.iters_per_epoch if cfg.get('log_interval_epochs') is not None else None
-        best_psnr, progress, source_file = select_best_checkpoint(
-            data_list, cfg.work_dir, epoch_steps)
+        best_metric = cfg.get('best_checkpoint_metric', 'PSNR')
+        best_rule = cfg.get('best_checkpoint_rule', 'greater')
+        best_score, progress, source_file = select_best_checkpoint(
+            data_list, cfg.work_dir, epoch_steps, best_metric, best_rule)
         unit = 'epoch' if epoch_steps else 'iter'
-        print('gen: {}, PSNR 最佳 {}: {:g}, PSNR: {}'.format(
-            gen, unit, progress, best_psnr))
+        print('gen: {}, {} 最佳 {}: {:g}, score: {}'.format(
+            gen, best_metric, unit, progress, best_score))
 
-        # 复制一份PSNR最大的checkpoint
+        # 复制按配置指标选出的 checkpoint
         # 源文件路径
         # 目标文件路径
         destination_file = osp.join(cfg.work_dir, 'best.pth')

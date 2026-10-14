@@ -11,3 +11,7 @@
 当前 A100 已有 `AdaInt_BAN` conda 环境、MMCV/MMEditing 和 AiLUT CUDA 扩展。本次修改不安装或升级依赖。新的模型与旧架构 checkpoint 不兼容，请从头训练；已有实验日志、数据、预训练文件与 Git 历史保留。
 
 基础项目：[AdaInt-BAN](https://github.com/zrk2/AdaInt-BAN)、[AdaInt](https://github.com/ImCharlesY/AdaInt)。本分支的结构改动和原论文实现存在差别，尚未完成全量 PPR10K 训练验证，不能视为复现论文指标。
+
+## Semantic dual fusion
+
+The new AiLUTDual enhancer uses independent foreground/background tone, AdaInt and residual LUT mappings, shared local spatial features, and mask fusion after per-branch correction. See [implementation and training guide](adaint/SEMANTIC_DUAL.md). Start with adaint/configs/face_indoor_semantic_dual.yaml; the original AiLUT configs remain available.

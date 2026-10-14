@@ -15,3 +15,9 @@ __all__ = [
     'FiveK', 'PPR10K', 'PPR10KFolder', 'Face', 'KD_Loss',
     'RandomRatioCrop', 'ResizeToMatch', 'FlexibleRescaleToZeroOne',
     'RandomColorJitter', 'FlipChannels']
+
+from .model_semantic import AiLUTDual
+from .semantic_pipeline import LoadSemanticMasks, SemanticContextAugment
+from .semantic_dataset import SemanticFace
+
+__all__ += ['AiLUTDual', 'LoadSemanticMasks', 'SemanticContextAugment', 'SemanticFace']

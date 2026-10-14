@@ -10,7 +10,7 @@ from mmcv import Config
 from mmcv.runner import HOOKS, Hook, get_dist_info
 from .epoch_hooks import configure_epoch_display
 
-ENHANCER_TYPES = ('AiLUT',)
+ENHANCER_TYPES = ('AiLUT', 'AiLUTDual')
 
 
 @HOOKS.register_module()
@@ -104,11 +104,13 @@ def public_training_config(cfg):
     return result
 
 
-def select_best_checkpoint(records, work_dir, steps_per_epoch=None):
+def select_best_checkpoint(records, work_dir, steps_per_epoch=None, metric='PSNR', rule='greater'):
     """Read new epoch logs and existing iteration logs when resuming."""
+    if rule not in ('greater', 'less'):
+        raise ValueError("checkpoint rule must be 'greater' or 'less'")
     candidates = {}
     for entry in records:
-        if entry.get('mode') != 'val' or 'PSNR' not in entry:
+        if entry.get('mode') != 'val' or metric not in entry:
             continue
         if 'iter' in entry:
             step = entry['iter']
@@ -121,10 +123,13 @@ def select_best_checkpoint(records, work_dir, steps_per_epoch=None):
             continue
         # A resumed run can overwrite the same epoch/iteration file. Retain
         # its latest validation, otherwise an older score can describe new weights.
-        candidates[filename] = (entry['PSNR'], progress, os.path.join(work_dir, filename))
+        if not math.isfinite(entry[metric]):
+            candidates.pop(filename, None)
+            continue
+        candidates[filename] = (entry[metric], progress, os.path.join(work_dir, filename))
     if not candidates:
-        raise ValueError('no validation PSNR recorded; training must reach its evaluation period')
-    return max(candidates.values(), key=lambda item: item[0])
+        raise ValueError('no finite validation {} recorded; training must reach its evaluation period'.format(metric))
+    return max(candidates.values(), key=lambda item: item[0] if rule == 'greater' else -item[0])
 
 
 def inference_config(cfg):

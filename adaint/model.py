@@ -201,7 +201,8 @@ class AiLUT(BaseModel):
                     results=dict(lq=lq.detach().cpu(), gt=gt.detach().cpu(), output=output.detach().cpu()))
 
     def forward_test(self, lq, gt=None, meta=None, save_image=False,
-                     save_path=None, iteration=None):
+                     save_path=None, iteration=None, foreground_mask=None,
+                     face_mask=None, supervision_mask=None):
         if isinstance(lq, (list, tuple)):
             if not lq:
                 raise ValueError('evaluation batch must contain images')
@@ -232,7 +233,13 @@ class AiLUT(BaseModel):
                     gt=(torch.stack([targets[index] for index in indices])
                         if targets is not None else None),
                     meta=([meta[index] for index in indices] if meta is not None else None),
-                    save_image=save_image, save_path=save_path, iteration=iteration)
+                    save_image=save_image, save_path=save_path, iteration=iteration,
+                    foreground_mask=(torch.stack([image_tensor(foreground_mask[index]) for index in indices])
+                                     if foreground_mask is not None else None),
+                    face_mask=(torch.stack([image_tensor(face_mask[index]) for index in indices])
+                               if face_mask is not None else None),
+                    supervision_mask=(torch.stack([image_tensor(supervision_mask[index]) for index in indices])
+                                      if supervision_mask is not None else None))
                 if isinstance(group_results, dict):
                     group_results = [group_results]
                 for index, result in zip(indices, group_results):
@@ -243,7 +250,10 @@ class AiLUT(BaseModel):
             raise ValueError('evaluation requires one metadata entry per image')
         if gt is not None and gt.shape != lq.shape:
             raise ValueError('evaluation input and GT sizes must match')
-        output, _, _ = self.forward_dummy(lq)
+        if foreground_mask is not None:
+            output, _, _ = self.forward_dummy(lq, foreground_mask=foreground_mask)
+        else:
+            output, _, _ = self.forward_dummy(lq)
         results = []
         for index in range(lq.size(0)):
             sample_output = output[index:index + 1]
@@ -252,8 +262,13 @@ class AiLUT(BaseModel):
             if self.test_cfg is not None and self.test_cfg.get('metrics', None):
                 if sample_gt is None:
                     raise ValueError('evaluation with metrics requires gt images')
+                semantic = (dict(foreground_mask=foreground_mask[index:index + 1],
+                                 face_mask=(face_mask[index:index + 1] if face_mask is not None else None),
+                                 supervision_mask=(supervision_mask[index:index + 1]
+                                                   if supervision_mask is not None else None))
+                            if foreground_mask is not None else {})
                 result = dict(eval_result=self.evaluate(
-                    sample_output, sample_gt, meta=sample_meta))
+                    sample_output, sample_gt, meta=sample_meta, **semantic))
             else:
                 result = dict(lq=lq[index:index + 1].cpu(), output=sample_output.cpu())
                 if sample_gt is not None:

@@ -1,13 +1,13 @@
 # Tone / basis LUT 消融实验
 
-DB94 独立工作目录：
-/DB/data/yujietang/IQ-LUT/image_enhance/AdaInt_BAN_basis_ablation
+DB94 工作目录：
+/DB/data/yujietang/IQ-LUT/image_enhance/AdaInt_BAN
 
 分支：experiment/basis-lut__from_semantic-dual
 父分支：feature/semantic-dual__from_p3-local-color
 父提交：fcaf8bc
 
-原目录 /DB/data/yujietang/IQ-LUT/image_enhance/AdaInt_BAN 的分支、室内参数和 p3.py 未被本次任务修改。使用同一仓库的独立 Git worktree。按本次确认，室内消融从 fcaf8bc 创建，沿用 color_loss_weight=0.3；原目录当前参数已另行提交为 3f4ca96，仍为 0.05。
+消融分支现已切换到原 AdaInt_BAN 目录，此前新建的独立目录已删除。原有 feature/semantic-dual__from_p3-local-color 分支及其 3f4ca96 提交完整保留，包含 color_loss_weight=0.05 和 p3.py 参数。本消融仍基于 fcaf8bc，按确认使用 color_loss_weight=0.3。
 
 ## 实验对比
 
@@ -52,10 +52,11 @@ forward_dummy、forward_train、forward_test、区域颜色统计、局部 decod
 
 ## 如何训练
 
-在 DB94 使用新目录运行。原目录中的新分支已在独立 worktree 检出，无需在原目录切换分支。
+在 DB94 原目录切换到消融分支后运行。
 
 ```bash
-cd /DB/data/yujietang/IQ-LUT/image_enhance/AdaInt_BAN_basis_ablation
+cd /DB/data/yujietang/IQ-LUT/image_enhance/AdaInt_BAN
+git switch experiment/basis-lut__from_semantic-dual
 source /DB/rhome/yujietang/miniconda3/etc/profile.d/conda.sh
 conda activate AdaInt_BAN
 ```
@@ -83,14 +84,14 @@ CUDA_VISIBLE_DEVICES=0 python tools/train_kd_unified.py \
 
 室外两组均沿用 color_loss_weight=0.1。
 
-结果目录均位于本独立 worktree 下：
+结果目录均位于原 AdaInt_BAN 目录下：
 
 - work_dirs/face_indoor_semantic_basis/gen_0
 - work_dirs/face_indoor_semantic_dual/gen_0
 - work_dirs/face_outdoor_semantic_basis/gen_0
 - work_dirs/face_outdoor_semantic_dual/gen_0
 
-训练流程沿用现有入口，保存 checkpoint、best.pth、配置和日志；训练结束使用 best.pth 对训练/验证图像导出满分辨率 train_infer/ 结果。原目录的历史结果不受影响。
+训练流程沿用现有入口，保存 checkpoint、best.pth、配置和日志；训练结束使用 best.pth 对训练/验证图像导出满分辨率 train_infer/ 结果。本次目录迁移不移动或删除历史结果；复跑已有实验时请用 --work-dir 指定新的输出目录，避免混用旧日志。
 
 ## 参数与 checkpoint
 
@@ -141,5 +142,5 @@ CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=2 python tools/smoke_semantic_dual.py \
 - 室内 mask 覆盖检查：训练 67、验证 8、测试 64 张均完整。
 - tools/train_kd_unified.py 完成 2 张训练图、1 张验证图的一轮完整检查，包含 best.pth 选取、保存、重新加载及 3 张满分辨率图像导出。训练/验证计算缩小至 128×128，仅用于流程验证。
 - 完整入口检查文件位于 DB94 的 /tmp/adaint-basis-runner-tu1yzrjx/work_dir/gen_0；真实数据短训练日志为 /tmp/adaint_basis_ablation_smoke.log。
-- 原目录的分支和室内 YAML、p3.py 参数保持，工作期间其原有改动已在原分支另行提交为 3f4ca96。
+- 原有分支及其室内 YAML、p3.py 参数保留在 3f4ca96；消融分支已迁回原目录，新建的独立目录已删除。
 - 没有运行 100 epochs 正式消融实验，当前验证不能用来判断 tone 与 basis 哪个效果更好。

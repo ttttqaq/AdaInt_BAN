@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from .modules import (ColorStatistics, ConditionEncoder, ToneCurve,
                       AdaptiveIntervals, NormalizedResidualLUT, LocalAffineDecoder,
-                      luminance, stratified_pixels)
+                      identity_lut, luminance, stratified_pixels)
 
 
 def checked_mask(mask, image, name='foreground_mask'):
@@ -60,18 +60,52 @@ class RegionColorStatistics(ColorStatistics):
                           sat_mean, sat_var.clamp_min(1e-12).sqrt()), 1)
 
 
+class BasisLUT(NormalizedResidualLUT):
+    """AdaInt-style raw basis fusion using the existing coefficient-head layout.
+
+    Reuse the parent's seeded allocation so common modules keep their original
+    initialization. Forward uses RAW trainable LUT values, without RMS
+    normalization or an external identity/tone contribution.
+    """
+    def __init__(self, n_vertices, n_ranks, condition_dim, hidden_dim):
+        super().__init__(n_vertices, n_ranks, condition_dim, hidden_dim)
+        uniform = torch.linspace(0, 1, n_vertices).view(1, 1, -1).expand(1, 3, -1)
+        with torch.no_grad():
+            # Same bank initialization as AdaInt/main: identity + zero bases.
+            self.basis_luts.zero_()
+            self.basis_luts[0].copy_(identity_lut(uniform)[0])
+            # All bases receive task gradients at initialization.
+            self.head.output.bias.fill_(1.)
+
+    def forward(self, condition):
+        weights = self.head(condition)
+        lut = torch.einsum('bm,mcijk->bcijk', weights, self.basis_luts)
+        return weights, lut
+
+
 class RegionMapping(nn.Module):
     def __init__(self, cnn_features, stats_features, condition_dim, hidden_dim,
-                 n_vertices, n_ranks, curve_points, min_interval):
+                 n_vertices, n_ranks, curve_points, min_interval, lut_mode='tone_residual'):
         super().__init__()
+        if lut_mode not in ('tone_residual', 'basis'):
+            raise ValueError("lut_mode must be 'tone_residual' or 'basis'")
+        self.lut_mode = lut_mode
         self.condition_encoder = ConditionEncoder(cnn_features, stats_features * 2 + 2, condition_dim)
+        # Preserve allocation order to keep all common seeded initializations.
         self.tone_curve = ToneCurve(curve_points, condition_dim, hidden_dim)
         self.adaint = AdaptiveIntervals(n_vertices, condition_dim, hidden_dim, min_interval)
-        self.lut_generator = NormalizedResidualLUT(n_vertices, n_ranks, condition_dim, hidden_dim)
+        generator = NormalizedResidualLUT if lut_mode == 'tone_residual' else BasisLUT
+        self.lut_generator = generator(n_vertices, n_ranks, condition_dim, hidden_dim)
+        if lut_mode == 'basis':
+            del self.tone_curve
 
     def forward(self, cnn_code, global_stats, region_stats, area, reliability):
         condition = self.condition_encoder(cnn_code, torch.cat(
             (global_stats, region_stats, area, reliability), 1))
+        if self.lut_mode == 'basis':
+            vertices = self.adaint(condition)
+            weights, lut = self.lut_generator(condition)
+            return condition, weights, vertices, lut
         curves = self.tone_curve.predict_curves(condition)
         vertices = self.adaint(condition)
         tone_vertices = self.tone_curve.apply_curves(vertices, curves)

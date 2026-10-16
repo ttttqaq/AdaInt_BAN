@@ -31,7 +31,11 @@ class AiLUTDual(AiLUT):
                  region_samples_size=32, region_sample_mix=.5, region_min_area=.0001,
                  foreground_rgb_weight=.1, background_rgb_weight=.1,
                  foreground_color_weight=.1, background_color_weight=.1,
-                 face_color_weight=0., boundary_gradient_weight=0., **kwargs):
+                 face_color_weight=0., boundary_gradient_weight=0.,
+                 lut_mode='tone_residual', **kwargs):
+        if lut_mode not in ('tone_residual', 'basis'):
+            raise ValueError("lut_mode must be 'tone_residual' or 'basis'")
+        self.lut_mode = lut_mode
         if kwargs.get('gen', 0) > 0 or kwargs.get('kd_loss') is not None:
             raise ValueError('AiLUTDual currently trains without BAN; use gen=1, enable_kd=false in config')
         super().__init__(**kwargs)
@@ -56,7 +60,7 @@ class AiLUTDual(AiLUT):
             delattr(self, name)
         options = (self.backbone.out_channels, self.color_statistics.output_features, dimension,
                    hidden, self.n_vertices, kwargs.get('n_ranks', 5),
-                   kwargs.get('curve_points', 16), kwargs.get('min_interval', .001))
+                   kwargs.get('curve_points', 16), kwargs.get('min_interval', .001), lut_mode)
         self.branches = nn.ModuleDict({name: RegionMapping(*options)
                                        for name in ('foreground', 'background')})
         if self.local_enabled:

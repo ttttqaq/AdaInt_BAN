@@ -1,6 +1,6 @@
 # Foreground = supplied face/hair/neck mask; independent skin supervision is optional.
 # Pipelines are wired by adaint.config_utils.load_config.
-exp_name: face_indoor_semantic_dual
+exp_name: face_indoor_semantic_dual_1
 custom_imports:
   imports:
   - adaint
@@ -37,7 +37,7 @@ model:
   local_magnitude_factor: 0.001
   local_smoothness_factor: 0.0001
   edge_smoothness_scale: 10.0
-  color_loss_weight: 0.3
+  color_loss_weight: 0.05
   color_grid_size: 16
   color_top_fraction: 0.1
   color_hard_weight: 0.25
@@ -225,7 +225,7 @@ visual_config: null
 dist_params:
   backend: nccl
 log_level: INFO
-work_dir: ./work_dirs/face_indoor_semantic_dual
+work_dir: ./work_dirs/face_indoor_semantic_dual_1
 load_from: null
 resume_from: null
 find_unused_parameters: true

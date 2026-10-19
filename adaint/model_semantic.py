@@ -13,6 +13,7 @@ from .color import p3_delta_e_map, display_p3_to_lab
 from .modules import stratified_pixels, lut_regularizations
 from .semantic_modules import (checked_mask, masked_per_image, RegionColorStatistics,
                                RegionMapping, DualLocalAffineDecoder)
+from .spatial_tone import SpatialLuminanceTone, region_lightness_loss
 
 
 def region_samples(image, mask, size):
@@ -32,7 +33,13 @@ class AiLUTDual(AiLUT):
                  foreground_rgb_weight=.1, background_rgb_weight=.1,
                  foreground_color_weight=.1, background_color_weight=.1,
                  face_color_weight=0., boundary_gradient_weight=0.,
-                 lut_mode='tone_residual', **kwargs):
+                 lut_mode='tone_residual', spatial_tone_enabled=False,
+                 tone_curves=3, tone_segments=16, tone_resolution=128, tone_channels=16,
+                 tone_max_gain=4., tone_max_slope=4., tone_gain_limit=2., tone_slope_limit=2.,
+                 region_lightness_weight=0., foreground_lightness_weight=1.,
+                 background_lightness_weight=1., shadow_weight=2., shadow_threshold=.5,
+                 tone_gain_factor=.001, tone_slope_factor=.001, tone_spatial_factor=.0001,
+                 **kwargs):
         if lut_mode not in ('tone_residual', 'basis'):
             raise ValueError("lut_mode must be 'tone_residual' or 'basis'")
         self.lut_mode = lut_mode
@@ -49,7 +56,13 @@ class AiLUTDual(AiLUT):
                                 foreground_color_weight=foreground_color_weight,
                                 background_color_weight=background_color_weight,
                                 face_color_weight=face_color_weight,
-                                boundary_gradient_weight=boundary_gradient_weight).items():
+                                boundary_gradient_weight=boundary_gradient_weight,
+                                region_lightness_weight=region_lightness_weight,
+                                foreground_lightness_weight=foreground_lightness_weight,
+                                background_lightness_weight=background_lightness_weight,
+                                shadow_weight=shadow_weight, tone_gain_factor=tone_gain_factor,
+                                tone_slope_factor=tone_slope_factor,
+                                tone_spatial_factor=tone_spatial_factor).items():
             if not math.isfinite(value) or value < 0:
                 raise ValueError(name + ' must be finite and non-negative')
             setattr(self, name, float(value))
@@ -67,6 +80,20 @@ class AiLUTDual(AiLUT):
             self.local_decoder = DualLocalAffineDecoder(dimension,
                 kwargs.get('local_resolution', 128), kwargs.get('local_channels', 16),
                 kwargs.get('guided_filter_radius', 2), kwargs.get('guided_filter_epsilon', .001))
+        if not 0 < shadow_threshold <= 1 or not 1 <= tone_gain_limit <= tone_max_gain or not 1 < tone_slope_limit <= tone_max_slope:
+            raise ValueError('invalid tone soft limits or shadow threshold')
+        self.shadow_threshold = float(shadow_threshold)
+        self.tone_gain_limit, self.tone_slope_limit = float(tone_gain_limit), float(tone_slope_limit)
+        self.spatial_tone_enabled = bool(spatial_tone_enabled)
+        self.tone_warmup_iters = int(self.train_cfg.get('tone_warmup_iters', 0))
+        if self.tone_warmup_iters < 0 or (self.tone_warmup_iters and not self.spatial_tone_enabled):
+            raise ValueError('tone warmup requires enabled tone and non-negative iterations')
+        self._tone_warmup = None
+        if self.spatial_tone_enabled:
+            self.spatial_tone = SpatialLuminanceTone(dimension, hidden, tone_curves,
+                tone_segments, tone_resolution, tone_channels,
+                kwargs.get('guided_filter_radius', 2), kwargs.get('guided_filter_epsilon', .001),
+                tone_max_gain, tone_max_slope)
 
     def forward_dummy(self, imgs, return_aux=False, lq_context=None, context_samples=None,
                       crop_box=None, foreground_mask=None, foreground_context=None,
@@ -145,6 +172,18 @@ class AiLUTDual(AiLUT):
                 context_deltas.append(torch.zeros_like(source))
                 lows.append(source.new_zeros((source.size(0), 4, *source.shape[-2:])))
                 means.append(source.new_zeros((source.size(0), 3, 1, 1)))
+        tone_aux = {}
+        if self.spatial_tone_enabled:
+            fields, reference = self.spatial_tone.predict(source, full_mask, conditions)
+            gains, base_outputs = [], outputs
+            outputs = []
+            for base, field in zip(base_outputs, fields):
+                toned, gain = self.spatial_tone.apply_tone(base, field, imgs, crop_box)
+                outputs.append(toned)
+                gains.append(gain)
+            tone_aux = dict(tone_fields=fields, tone_reference=reference,
+                            tone_gains=gains, pre_tone_outputs=base_outputs,
+                            tone_mask=full_mask)
         output = foreground_mask * outputs[0] + (1 - foreground_mask) * outputs[1]
         weights, vertices = torch.stack(weights_list, 1), torch.stack(vertices_list, 1)
         if return_aux:
@@ -153,7 +192,7 @@ class AiLUTDual(AiLUT):
                 global_outputs=global_outputs, local_deltas=deltas,
                 context_deltas=context_deltas, delta_means=means,
                 low_coefficients=lows, local_reference=low_source,
-                local_masks=(low_mask, 1 - low_mask), statistics=stats_list)
+                local_masks=(low_mask, 1 - low_mask), statistics=stats_list, **tone_aux)
         return output, weights, vertices
 
     def forward_train(self, lq, gt, lq_context=None, context_samples=None, crop_box=None,
@@ -187,6 +226,31 @@ class AiLUTDual(AiLUT):
             face, _, _ = masked_per_image(color_error, face_mask, self.region_min_area)
             losses['loss_face_color'] = self.face_color_weight * face / 100.
         lab_difference = display_p3_to_lab(output) - display_p3_to_lab(gt)
+        if self.region_lightness_weight:
+            input_lightness = (display_p3_to_lab(lq)[:, :1] / 100.).clamp(0, 1)
+            for name, mask in (('foreground', supervision_mask), ('background', 1 - supervision_mask)):
+                lightness = region_lightness_loss(lab_difference[:, :1] / 100., input_lightness,
+                    mask, self.region_min_area, self.shadow_weight, self.shadow_threshold)
+                losses['loss_' + name + '_lightness'] = (self.region_lightness_weight *
+                    getattr(self, name + '_lightness_weight') * lightness)
+        if self.spatial_tone_enabled:
+            curve, spatial = self.spatial_tone.regularizers(aux['tone_fields'],
+                aux['tone_reference'], aux['tone_mask'], self.region_min_area,
+                self.tone_slope_limit, self.edge_smoothness_scale)
+            gain_penalty = output.new_zeros(())
+            for index, name in enumerate(('foreground', 'background')):
+                mask = supervision_mask if index == 0 else 1 - supervision_mask
+                gain = aux['tone_gains'][index]
+                gain_penalty = gain_penalty + masked_per_image(
+                    F.relu(gain - self.tone_gain_limit).square(), mask, self.region_min_area)[0] / 2
+                losses['tone_' + name + '_gain_mean'] = masked_per_image(
+                    gain, mask, self.region_min_area)[0].detach()
+                losses['tone_' + name + '_gain_max'] = (gain * mask).detach().max()
+            for name, factor, penalty in (('loss_tone_gain', self.tone_gain_factor, gain_penalty),
+                    ('loss_tone_slope', self.tone_slope_factor, curve),
+                    ('loss_tone_spatial', self.tone_spatial_factor, spatial)):
+                if factor:
+                    losses[name] = factor * penalty
         for key, error in (('foreground_delta_L', lab_difference[:, :1].abs()),
                            ('foreground_delta_ab', lab_difference[:, 1:].square().sum(1).clamp_min(1e-12).sqrt())):
             losses[key] = masked_per_image(error, supervision_mask, self.region_min_area)[0].detach()
@@ -232,7 +296,22 @@ class AiLUTDual(AiLUT):
                     results=dict(lq=lq.detach().cpu(), gt=gt.detach().cpu(), output=output.detach().cpu()))
 
     def train_step(self, data_batch, optimizer):
-        frozen = self.cnt_iters.item() < self.n_fix_iters
+        warmup = self.spatial_tone_enabled and self.cnt_iters.item() < self.tone_warmup_iters
+        if self.spatial_tone_enabled and warmup != self._tone_warmup:
+            for name, parameter in self.named_parameters():
+                parameter.requires_grad_(not warmup or name.startswith('spatial_tone.'))
+            for name, module in self.named_children():
+                if name != 'spatial_tone':
+                    module.train(self.training and not warmup)
+            self._tone_warmup = warmup
+            get_root_logger().info('Tone training phase: %s at iteration %s',
+                'tone only' if warmup else 'joint', int(self.cnt_iters.item()))
+        if warmup:
+            # Runner calls train() repeatedly; keep the fixed backbone/dropout in eval.
+            for name, module in self.named_children():
+                if name != 'spatial_tone':
+                    module.eval()
+        frozen = warmup or self.cnt_iters.item() < self.n_fix_iters
         if frozen != self.adaint_fixed:
             for branch in self.branches.values():
                 branch.adaint.requires_grad_(not frozen)
@@ -251,7 +330,8 @@ class AiLUTDual(AiLUT):
     def evaluate(self, output, gt, meta=None, foreground_mask=None, face_mask=None,
                  supervision_mask=None):
         extra_names = {'deltaE_P3_foreground', 'deltaE_P3_background', 'deltaE_P3_face',
-                       'deltaL_P3_foreground', 'deltaAB_P3_foreground'}
+                       'deltaL_P3_foreground', 'deltaAB_P3_foreground',
+                       'deltaL_P3_background', 'deltaL_P3_highlights'}
         # Use an independent ConfigDict, since inherited evaluate knows global metrics.
         original = self.test_cfg
         self.test_cfg = type(original)(dict(original))
@@ -270,16 +350,21 @@ class AiLUTDual(AiLUT):
             if face_mask is not None:
                 face_mask = face_mask[..., border:-border, border:-border]
         color = p3_delta_e_map(pred, target)
-        lab = display_p3_to_lab(pred) - display_p3_to_lab(target)
+        target_lab = display_p3_to_lab(target)
+        lab = display_p3_to_lab(pred) - target_lab
         for name, region_mask, error in (
             ('deltaE_P3_foreground', mask, color),
             ('deltaE_P3_background', 1 - mask, color),
             ('deltaL_P3_foreground', mask, lab[:, :1].abs()),
+            ('deltaL_P3_background', 1 - mask, lab[:, :1].abs()),
+            ('deltaL_P3_highlights', (target_lab[:, :1] >= 80.).to(mask), lab[:, :1].abs()),
             ('deltaAB_P3_foreground', mask, lab[:, 1:].norm(dim=1))):
             if name in original.metrics:
                 value, _, valid = masked_per_image(error, region_mask, self.region_min_area)
                 result[name] = value.item()
-                result['_valid_' + ('background' if name.endswith('background') else 'foreground')] = valid.item()
+                region = ('highlights' if name.endswith('highlights') else
+                          'background' if name.endswith('background') else 'foreground')
+                result['_valid_' + region] = valid.item()
         if 'deltaE_P3_face' in original.metrics:
             face_mask = checked_mask(face_mask, pred, 'face_mask')
             value, _, valid = masked_per_image(color, face_mask, self.region_min_area)

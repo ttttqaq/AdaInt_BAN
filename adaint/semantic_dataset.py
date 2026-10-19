@@ -18,6 +18,7 @@ class SemanticFace(Face):
                     counts[name[7:]] += int(value > 0)
                     continue
                 region = ('background' if name.endswith('_background') else
+                          'highlights' if name.endswith('_highlights') else
                           'face' if name.endswith('_face') else
                           'foreground' if name.endswith('_foreground') else None)
                 if region and metrics.get('_valid_' + region, 1) <= 0:

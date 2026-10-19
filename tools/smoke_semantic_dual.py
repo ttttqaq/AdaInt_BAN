@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from mmedit.datasets import build_dataset
 from mmedit.models import build_model
 from adaint.config_utils import load_config
+from adaint.experiment_utils import initialize_tone_from_baseline
 from adaint.semantic_pipeline import LoadSemanticMasks
 
 
@@ -54,6 +55,8 @@ def main():
     parser.add_argument('--steps', type=int, default=2)
     parser.add_argument('--max-side', type=int, default=256)
     parser.add_argument('--check-mask-coverage', action='store_true')
+    parser.add_argument('--tone-warmup-steps', type=int, default=1,
+                        help='short tone-only stage for tone-enabled smoke checks')
     args = parser.parse_args()
     if args.steps < 1 or args.max_side < 32:
         raise ValueError('steps >= 1 and max-side >= 32 required')
@@ -65,8 +68,14 @@ def main():
     if args.check_mask_coverage:
         print(json.dumps(dict(mask_coverage={split: check_coverage(dataset)
                                            for split, dataset in datasets.items()})))
-    model = build_model(cfg.model, train_cfg=dict(total_iters=args.steps, n_fix_iters=0),
+    warmup = args.tone_warmup_steps if cfg.model.get('spatial_tone_enabled', False) else 0
+    if not 0 <= warmup < args.steps:
+        raise ValueError('tone smoke warmup must be in [0, steps) to check the joint stage too')
+    model = build_model(cfg.model, train_cfg=dict(total_iters=args.steps, n_fix_iters=0,
+                                                tone_warmup_iters=warmup),
                         test_cfg=cfg.test_cfg).to(args.device)
+    if cfg.get('tone_init_from'):
+        initialize_tone_from_baseline(model, cfg.tone_init_from)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.optimizers.lr)
     for step in range(args.steps):
         model.train()
@@ -74,6 +83,9 @@ def main():
         result = model.train_step(data, optimizer)
         if any(not math.isfinite(value) for value in result['log_vars'].values()):
             raise RuntimeError('nonfinite smoke training log')
+        if any(parameter.grad is not None and not torch.isfinite(parameter.grad).all()
+               for parameter in model.parameters()):
+            raise RuntimeError('nonfinite smoke gradient')
         print(json.dumps(dict(step=step + 1, train=result['log_vars'])))
     model.eval()
     data = tensor_batch(datasets['val'][0], args.device, args.max_side)

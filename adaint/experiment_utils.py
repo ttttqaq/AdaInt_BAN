@@ -44,6 +44,14 @@ def resolve_training_schedule(cfg, dataset_size, distributed=False):
         cfg.train_cfg = cfg.get('train_cfg') or {}
         cfg.total_iters = int(steps * cfg.train_epochs)
         cfg.train_cfg.n_fix_iters = int(steps * cfg.get('adaint_fix_epochs', 5))
+        if cfg.get('tone_warmup_epochs') is not None:
+            warmup = cfg.tone_warmup_epochs
+            if (isinstance(warmup, bool) or not isinstance(warmup, numbers.Integral) or
+                    not 0 <= warmup < cfg.train_epochs):
+                raise ValueError('tone_warmup_epochs must be an integer in [0, train_epochs)')
+            if warmup and not cfg.model.get('spatial_tone_enabled', False):
+                raise ValueError('tone warmup requires spatial_tone_enabled')
+            cfg.train_cfg.tone_warmup_iters = int(steps * warmup)
         if cfg.get('checkpoint_config'):
             cfg.checkpoint_config.interval = int(steps * cfg.get('checkpoint_interval_epochs', 1))
         if cfg.get('evaluation'):
@@ -84,7 +92,7 @@ def public_training_config(cfg):
     for key in ('total_iters', 'iters_per_epoch', 'workflow'):
         result.pop(key, None)
     if result.get('train_cfg') is not None:
-        for key in ('n_fix_iters', 'total_iters'):
+        for key in ('n_fix_iters', 'total_iters', 'tone_warmup_iters'):
             result.train_cfg.pop(key, None)
         if not result.train_cfg:
             result.pop('train_cfg', None)
@@ -190,5 +198,31 @@ def load_enhancer_checkpoint(model, filename):
     # A training model may already contain its frozen, separately loaded teacher.
     # Validate every enhancer key, then preserve that teacher during preflight.
     current.update(state)
+    model.load_state_dict(current, strict=True)
+    return checkpoint
+
+
+def initialize_tone_from_baseline(model, filename):
+    """Copy ONLY an exactly matching dual baseline; start a fresh tone schedule.
+
+    All old keys/shapes must match. Only the newly initialized spatial_tone
+    namespace may be absent. Resuming a tone checkpoint uses strict loading.
+    Also supports the supervision-only ablation with tone disabled.
+    """
+    if type(model).__name__ != 'AiLUTDual':
+        raise ValueError('tone_init_from requires AiLUTDual')
+    checkpoint = torch.load(filename, map_location='cpu')
+    state = checkpoint.get('state_dict', checkpoint)
+    state = {key[7:] if key.startswith('module.') else key: value for key, value in state.items()}
+    current = model.state_dict()
+    expected = {key: value for key, value in current.items() if not key.startswith('spatial_tone.')}
+    missing = sorted(set(expected) - set(state))
+    unexpected = sorted(set(state) - set(expected))
+    shapes = sorted(key for key in set(state) & set(expected) if state[key].shape != expected[key].shape)
+    if missing or unexpected or shapes:
+        raise RuntimeError('incompatible tone baseline: missing={}, unexpected={}, shape_mismatches={}'.format(
+            missing, unexpected, shapes))
+    current.update({key: value for key, value in state.items() if key != 'cnt_iters'})
+    current['cnt_iters'] = torch.zeros_like(current['cnt_iters'])
     model.load_state_dict(current, strict=True)
     return checkpoint

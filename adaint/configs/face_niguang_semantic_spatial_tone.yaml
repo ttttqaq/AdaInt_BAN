@@ -2,7 +2,7 @@
 # Train: first 90% of numeric IDs; val: last ceil(10%).
 # No independent test split: data.test reuses validation, not a held-out test set.
 # Post-LUT linear-P3 spatial luminance tone; baseline data/pipelines remain the same.
-exp_name: face_niguang_semantic_spatial_tone
+exp_name: face_niguang_semantic_spatial_tone_1
 custom_imports:
   imports:
   - adaint
@@ -265,7 +265,7 @@ visual_config: null
 dist_params:
   backend: nccl
 log_level: INFO
-work_dir: ./work_dirs/face_niguang_semantic_spatial_tone
+work_dir: ./work_dirs/face_niguang_semantic_spatial_tone_1
 load_from: null
 resume_from: null
 find_unused_parameters: true

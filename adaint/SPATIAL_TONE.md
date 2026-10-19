@@ -1,5 +1,9 @@
 # 双路 LUT 后接空间自适应亮度 tone
 
+当前推荐的新方案是仅前景双向空间增益，见 [FOREGROUND_GAIN.md](FOREGROUND_GAIN.md)，
+运行配置为 `adaint/configs/face_niguang_foreground_gain.yaml`。
+下文保留为已完成的曲线实验说明，原模式仍可用于加载旧 checkpoint。
+
 DB94 仓库：`/DB/data/yujietang/IQ-LUT/image_enhance/AdaInt_BAN`。
 新分支：`feature/spatial-tone__from_basis-lut`，父提交：`33a4890`。
 

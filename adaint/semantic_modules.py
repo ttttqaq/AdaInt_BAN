@@ -127,7 +127,7 @@ class DualLocalAffineDecoder(LocalAffineDecoder):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
-    def forward(self, source, conditions):
+    def forward(self, source, conditions, return_features=False):
         small = F.interpolate(source, (self.resolution,) * 2, mode='bilinear', align_corners=False)
         shallow = self.shallow(small)
         deep = F.interpolate(self.deep(shallow), shallow.shape[-2:], mode='bilinear', align_corners=False)
@@ -147,4 +147,6 @@ class DualLocalAffineDecoder(LocalAffineDecoder):
             slope = covariance / (variance.clamp_min(0) + self.epsilon)
             offset = mean_p - slope * mean_g
             results.append((low, self.box_mean(slope), self.box_mean(offset)))
+        if return_features:
+            return results, low_source, shared
         return results, low_source

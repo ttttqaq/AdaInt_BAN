@@ -202,7 +202,7 @@ def load_enhancer_checkpoint(model, filename):
     return checkpoint
 
 
-def initialize_tone_from_baseline(model, filename):
+def initialize_tone_from_baseline(model, filename, _adapter_prefix='spatial_tone.'):
     """Copy ONLY an exactly matching dual baseline; start a fresh tone schedule.
 
     All old keys/shapes must match. Only the newly initialized spatial_tone
@@ -215,7 +215,7 @@ def initialize_tone_from_baseline(model, filename):
     state = checkpoint.get('state_dict', checkpoint)
     state = {key[7:] if key.startswith('module.') else key: value for key, value in state.items()}
     current = model.state_dict()
-    expected = {key: value for key, value in current.items() if not key.startswith('spatial_tone.')}
+    expected = {key: value for key, value in current.items() if not key.startswith(_adapter_prefix)}
     missing = sorted(set(expected) - set(state))
     unexpected = sorted(set(state) - set(expected))
     shapes = sorted(key for key in set(state) & set(expected) if state[key].shape != expected[key].shape)
@@ -226,3 +226,10 @@ def initialize_tone_from_baseline(model, filename):
     current['cnt_iters'] = torch.zeros_like(current['cnt_iters'])
     model.load_state_dict(current, strict=True)
     return checkpoint
+
+
+def initialize_foreground_gain_from_baseline(model, filename):
+    """Only the new gain adapter may be missing; reject old curve checkpoints."""
+    if not getattr(model, 'foreground_gain_enabled', False):
+        raise ValueError('gain_init_from requires foreground_gain_enabled')
+    return initialize_tone_from_baseline(model, filename, _adapter_prefix='foreground_gain.')

@@ -12,7 +12,8 @@ import torch.nn.functional as F
 from mmedit.datasets import build_dataset
 from mmedit.models import build_model
 from adaint.config_utils import load_config
-from adaint.experiment_utils import initialize_tone_from_baseline
+from adaint.experiment_utils import (initialize_tone_from_baseline,
+                                     initialize_foreground_gain_from_baseline)
 from adaint.semantic_pipeline import LoadSemanticMasks
 
 
@@ -76,7 +77,9 @@ def main():
                         test_cfg=cfg.test_cfg).to(args.device)
     if cfg.get('tone_init_from'):
         initialize_tone_from_baseline(model, cfg.tone_init_from)
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.optimizers.lr)
+    if cfg.get('gain_init_from'):
+        initialize_foreground_gain_from_baseline(model, cfg.gain_init_from)
+    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=cfg.optimizers.lr)
     for step in range(args.steps):
         model.train()
         data = tensor_batch(datasets['train'][step % len(datasets['train'])], args.device, args.max_side)

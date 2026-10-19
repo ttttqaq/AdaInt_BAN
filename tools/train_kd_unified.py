@@ -28,7 +28,7 @@ from adaint.config_utils import load_config
 from adaint.experiment_utils import (
     ENHANCER_TYPES, inference_config, load_enhancer_checkpoint,
     resolve_training_schedule, save_generation_configs, configure_epoch_display,
-    select_best_checkpoint, initialize_tone_from_baseline)
+    select_best_checkpoint, initialize_tone_from_baseline, initialize_foreground_gain_from_baseline)
 
 
 def parse_args():
@@ -191,6 +191,8 @@ def main():
     args = parse_args()
 
     base_cfg = load_config(args.config)
+    if args.seed is None:
+        args.seed = base_cfg.get('seed', None)
     if args.work_dir is not None:
         work_dir = args.work_dir
     else:
@@ -249,7 +251,12 @@ def main():
                 evaluation_interval % checkpoint_interval != 0):
             raise ValueError('evaluation interval must be a positive multiple of '
                              'checkpoint interval to select an existing best checkpoint')
-        if cfg.get('log_interval_epochs') is not None:
+        if cfg.model.get('foreground_gain_enabled', False):
+            logger.info('Training schedule: %s images, %s epochs; entire baseline fixed '
+                        'throughout, foreground gain only; save/evaluate every %s/%s epochs',
+                        len(datasets[0]), cfg.train_epochs, cfg.checkpoint_interval_epochs,
+                        cfg.evaluation_interval_epochs)
+        elif cfg.get('log_interval_epochs') is not None:
             logger.info('Training schedule: %s images, %s epochs/generation, '
                         'AdaInt fixed for %s epochs; save every %s epochs, '
                         'evaluate every %s epochs, log every %s epochs',
@@ -263,6 +270,17 @@ def main():
         save_generation_configs(cfg)
         model = build_model(
             cfg.model, train_cfg=cfg.train_cfg, test_cfg=cfg.test_cfg)
+        if cfg.get('gain_init_from') and cfg.get('tone_init_from'):
+            raise ValueError('gain_init_from and tone_init_from are mutually exclusive')
+        if cfg.model.get('foreground_gain_enabled', False):
+            if not (cfg.get('gain_init_from') or cfg.get('resume_from') or cfg.get('load_from')):
+                raise ValueError('foreground gain training needs a baseline or full gain checkpoint')
+        if cfg.get('gain_init_from') and not cfg.get('resume_from'):
+            if cfg.get('load_from'):
+                raise ValueError('use gain_init_from or load_from, not both')
+            initialize_foreground_gain_from_baseline(model, cfg.gain_init_from)
+            logger.info('Initialized frozen baseline from %s; only foreground_gain parameters '
+                        'are trained for the entire run; counter/optimizer start afresh', cfg.gain_init_from)
         if cfg.get('tone_init_from') and not cfg.get('resume_from'):
             if cfg.get('load_from'):
                 raise ValueError('use tone_init_from or load_from, not both')

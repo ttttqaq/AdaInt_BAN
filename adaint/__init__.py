@@ -17,7 +17,8 @@ __all__ = [
     'RandomColorJitter', 'FlipChannels']
 
 from .model_semantic import AiLUTDual
+from .model_roi_lab import AiLUTROILab
 from .semantic_pipeline import LoadSemanticMasks, SemanticContextAugment
 from .semantic_dataset import SemanticFace
 
-__all__ += ['AiLUTDual', 'LoadSemanticMasks', 'SemanticContextAugment', 'SemanticFace']
+__all__ += ['AiLUTDual', 'AiLUTROILab', 'LoadSemanticMasks', 'SemanticContextAugment', 'SemanticFace']

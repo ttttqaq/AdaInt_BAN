@@ -28,7 +28,7 @@ from adaint.config_utils import load_config
 from adaint.experiment_utils import (
     ENHANCER_TYPES, inference_config, load_enhancer_checkpoint,
     resolve_training_schedule, save_generation_configs, configure_epoch_display,
-    select_best_checkpoint)
+    select_best_checkpoint, initialize_roi_lab_from_basis)
 
 
 def parse_args():
@@ -94,7 +94,7 @@ def infer_and_save_split(cfg, dataset_cfg, checkpoint_path, save_dir):
         dict(type='ImageToTensor', keys=['lq']),
         dict(type='Collect', keys=['lq'], meta_keys=['lq_path']),
     ]
-    if cfg.model.type == 'AiLUTDual':
+    if cfg.model.type in ('AiLUTDual', 'AiLUTROILab'):
         from adaint.semantic_pipeline import semantic_mask_step
         split = 'train' if dataset_cfg.ann_file == cfg.data.train.ann_file else 'val'
         step = semantic_mask_step(cfg, split, training=False)
@@ -142,6 +142,25 @@ def infer_and_save_split(cfg, dataset_cfg, checkpoint_path, save_dir):
         if fname.endswith('_input.png'):
             new_name = fname[:-len('_input.png')] + '_result.png'
             os.replace(osp.join(save_dir, fname), osp.join(save_dir, new_name))
+    if cfg.model.type == 'AiLUTROILab':
+        # The new decoder explicitly uses encoded Display P3. Carry the input's
+        # P3 tag into PNGs, without changing their RGB numbers or GT-free inference.
+        import io
+        from PIL import Image, ImageCms
+        for entry in dataset.data_infos:
+            source = entry['lq_path']
+            with Image.open(source) as image:
+                profile = image.info.get('icc_profile')
+            if not profile:
+                continue
+            description = ImageCms.getProfileDescription(ImageCms.ImageCmsProfile(io.BytesIO(profile)))
+            if 'p3' not in description.lower():
+                raise ValueError('ROI Lab expects Display P3 input, got ' + description)
+            stem = osp.splitext(osp.basename(source))[0]
+            stem = stem[:-6] if stem.endswith('_input') else stem
+            target = osp.join(save_dir, stem + '_result.png')
+            with Image.open(target) as image:
+                image.save(target, icc_profile=profile)
 
 
 def build_generation_config(base_cfg, gen, work_dir, args):
@@ -191,6 +210,8 @@ def main():
     args = parse_args()
 
     base_cfg = load_config(args.config)
+    if args.seed is None:
+        args.seed = base_cfg.get('seed')
     if args.work_dir is not None:
         work_dir = args.work_dir
     else:
@@ -263,6 +284,22 @@ def main():
         save_generation_configs(cfg)
         model = build_model(
             cfg.model, train_cfg=cfg.train_cfg, test_cfg=cfg.test_cfg)
+        roi_source = cfg.get('roi_init_from')
+        if cfg.model.type == 'AiLUTROILab':
+            if not (roi_source or cfg.get('resume_from') or cfg.get('load_from')):
+                raise ValueError('ROI Lab requires roi_init_from or a full ROI checkpoint')
+            if roi_source and cfg.get('load_from'):
+                raise ValueError('choose roi_init_from OR load_from, not both')
+            if roi_source and not cfg.get('resume_from'):
+                initialize_roi_lab_from_basis(model, roi_source)
+                logger.info('Initialize compatible basis weights from %s; replace FG affine head; reset step counter', roi_source)
+            frozen = [name for name, parameter in model.named_parameters() if not parameter.requires_grad]
+            if frozen or model.n_fix_iters:
+                raise ValueError('ROI Lab requires all parameters trainable, frozen={}'.format(frozen))
+            logger.info('ROI Lab: joint training from step 1, all %s parameters trainable; no AdaInt freeze',
+                        sum(parameter.numel() for parameter in model.parameters()))
+        elif roi_source:
+            raise ValueError('roi_init_from only applies to AiLUTROILab')
 
         if len(cfg.workflow) == 2:
             val_dataset = copy.deepcopy(cfg.data.val)
@@ -327,6 +364,14 @@ def main():
         # 目标文件路径
         destination_file = osp.join(cfg.work_dir, 'best.pth')
         shutil.copy(source_file, destination_file)
+        if cfg.model.type == 'AiLUTROILab':
+            psnr_score, psnr_progress, psnr_source = select_best_checkpoint(
+                data_list, cfg.work_dir, epoch_steps, 'PSNR', 'greater')
+            shutil.copy(psnr_source, osp.join(cfg.work_dir, 'best_psnr.pth'))
+            with open(osp.join(cfg.work_dir, 'best_selection.json'), 'w') as handle:
+                json.dump(dict(metric=best_metric, rule=best_rule, score=best_score,
+                    progress=progress, source=source_file, psnr_score=psnr_score,
+                    psnr_progress=psnr_progress, psnr_source=psnr_source), handle, indent=2)
 
         # 用刚生成的 best.pth 对本代的训练集 + 验证集全部图片跑一遍推理（每张
         # 图都在其原图满分辨率上跑，不做 ResizeToMatch/裁剪），结果图片保存在

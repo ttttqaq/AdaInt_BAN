@@ -99,9 +99,14 @@ class RegionMapping(nn.Module):
         if lut_mode == 'basis':
             del self.tone_curve
 
-    def forward(self, cnn_code, global_stats, region_stats, area, reliability):
+    def forward(self, cnn_code, global_stats, region_stats, area, reliability,
+                condition_offset=None):
         condition = self.condition_encoder(cnn_code, torch.cat(
             (global_stats, region_stats, area, reliability), 1))
+        if condition_offset is not None:
+            if condition_offset.shape != condition.shape:
+                raise ValueError('regional condition offset shape mismatch')
+            condition = condition + condition_offset
         if self.lut_mode == 'basis':
             vertices = self.adaint(condition)
             weights, lut = self.lut_generator(condition)
@@ -116,7 +121,8 @@ class RegionMapping(nn.Module):
 
 class DualLocalAffineDecoder(LocalAffineDecoder):
     """Extract spatial features once, then use independent FiLM/output heads."""
-    def __init__(self, condition_dim, resolution=128, channels=16, radius=2, epsilon=.001):
+    def __init__(self, condition_dim, resolution=128, channels=16, radius=2, epsilon=.001,
+                 foreground_enabled=True):
         super().__init__(condition_dim, resolution, channels, radius, epsilon)
         del self.film
         del self.output
@@ -126,6 +132,10 @@ class DualLocalAffineDecoder(LocalAffineDecoder):
             nn.init.zeros_(module.weight)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
+        self.foreground_enabled = bool(foreground_enabled)
+        if not self.foreground_enabled:
+            # Retain background checkpoint names (.1.*), remove obsolete FG parameters.
+            self.films[0], self.outputs[0] = nn.Identity(), nn.Identity()
 
     def forward(self, source, conditions):
         small = F.interpolate(source, (self.resolution,) * 2, mode='bilinear', align_corners=False)
@@ -137,7 +147,11 @@ class DualLocalAffineDecoder(LocalAffineDecoder):
         mean_g = self.box_mean(guidance)
         variance = self.box_mean(guidance.square()) - mean_g.square()
         results = []
-        for condition, film, output in zip(conditions, self.films, self.outputs):
+        for index, (condition, film, output) in enumerate(zip(conditions, self.films, self.outputs)):
+            if index == 0 and not self.foreground_enabled:
+                zero = shared.new_zeros((shared.size(0), 4, *shared.shape[-2:]))
+                results.append((zero, zero, zero))
+                continue
             gamma, beta = film(condition).chunk(2, 1)
             features = F.leaky_relu((1 + gamma[:, :, None, None]) * shared +
                                    beta[:, :, None, None], negative_slope=.2)

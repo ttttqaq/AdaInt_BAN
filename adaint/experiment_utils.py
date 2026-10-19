@@ -10,7 +10,7 @@ from mmcv import Config
 from mmcv.runner import HOOKS, Hook, get_dist_info
 from .epoch_hooks import configure_epoch_display
 
-ENHANCER_TYPES = ('AiLUT', 'AiLUTDual')
+ENHANCER_TYPES = ('AiLUT', 'AiLUTDual', 'AiLUTROILab')
 
 
 @HOOKS.register_module()
@@ -190,5 +190,32 @@ def load_enhancer_checkpoint(model, filename):
     # A training model may already contain its frozen, separately loaded teacher.
     # Validate every enhancer key, then preserve that teacher during preflight.
     current.update(state)
+    model.load_state_dict(current, strict=True)
+    return checkpoint
+
+
+def initialize_roi_lab_from_basis(model, filename):
+    """Allow ONLY the explicitly replaced FG head and newly introduced ROI keys.
+
+    This is initialization, not resume: reject other architectures, retain all
+    compatible learned weights, reset the counter and never import old optimizer state.
+    """
+    if model.__class__.__name__ != 'AiLUTROILab':
+        raise ValueError('ROI initialization requires AiLUTROILab')
+    checkpoint = torch.load(filename, map_location='cpu')
+    state = checkpoint.get('state_dict', checkpoint)
+    state = {key[7:] if key.startswith('module.') else key: value for key, value in state.items()}
+    retired = {'local_decoder.films.0.weight', 'local_decoder.films.0.bias',
+               'local_decoder.outputs.0.weight'}
+    current = model.state_dict()
+    inherited = {key for key in current if not key.startswith('foreground_roi.')}
+    missing = sorted((inherited | retired) - set(state))
+    unexpected = sorted(set(state) - inherited - retired)
+    shapes = sorted(key for key in inherited & set(state) if state[key].shape != current[key].shape)
+    if missing or unexpected or shapes:
+        raise RuntimeError('incompatible basis initialization: missing={}, unexpected={}, '
+                           'shape_mismatches={}'.format(missing, unexpected, shapes))
+    current.update({key: state[key] for key in inherited})
+    current['cnt_iters'] = torch.zeros_like(current['cnt_iters'])
     model.load_state_dict(current, strict=True)
     return checkpoint

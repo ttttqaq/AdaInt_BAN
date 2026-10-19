@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from mmedit.datasets import build_dataset
 from mmedit.models import build_model
 from adaint.config_utils import load_config
+from adaint.experiment_utils import initialize_roi_lab_from_basis
 from adaint.semantic_pipeline import LoadSemanticMasks
 
 
@@ -58,8 +59,8 @@ def main():
     if args.steps < 1 or args.max_side < 32:
         raise ValueError('steps >= 1 and max-side >= 32 required')
     cfg = load_config(args.config)
-    if cfg.model.type != 'AiLUTDual':
-        raise ValueError('this smoke check requires AiLUTDual')
+    if cfg.model.type not in ('AiLUTDual', 'AiLUTROILab'):
+        raise ValueError('this smoke check requires a semantic dual model')
     torch.manual_seed(2026)
     datasets = {split: build_dataset(cfg.data[split]) for split in ('train', 'val', 'test')}
     if args.check_mask_coverage:
@@ -67,6 +68,8 @@ def main():
                                            for split, dataset in datasets.items()})))
     model = build_model(cfg.model, train_cfg=dict(total_iters=args.steps, n_fix_iters=0),
                         test_cfg=cfg.test_cfg).to(args.device)
+    if cfg.get('roi_init_from'):
+        initialize_roi_lab_from_basis(model, cfg.roi_init_from)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.optimizers.lr)
     for step in range(args.steps):
         model.train()

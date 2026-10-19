@@ -32,7 +32,7 @@ class AiLUTDual(AiLUT):
                  foreground_rgb_weight=.1, background_rgb_weight=.1,
                  foreground_color_weight=.1, background_color_weight=.1,
                  face_color_weight=0., boundary_gradient_weight=0.,
-                 lut_mode='tone_residual', **kwargs):
+                 lut_mode='tone_residual', foreground_local_enabled=True, **kwargs):
         if lut_mode not in ('tone_residual', 'basis'):
             raise ValueError("lut_mode must be 'tone_residual' or 'basis'")
         self.lut_mode = lut_mode
@@ -66,12 +66,14 @@ class AiLUTDual(AiLUT):
         if self.local_enabled:
             self.local_decoder = DualLocalAffineDecoder(dimension,
                 kwargs.get('local_resolution', 128), kwargs.get('local_channels', 16),
-                kwargs.get('guided_filter_radius', 2), kwargs.get('guided_filter_epsilon', .001))
+                kwargs.get('guided_filter_radius', 2), kwargs.get('guided_filter_epsilon', .001),
+                foreground_enabled=foreground_local_enabled)
 
     def forward_dummy(self, imgs, return_aux=False, lq_context=None, context_samples=None,
                       crop_box=None, foreground_mask=None, foreground_context=None,
                       foreground_samples=None, foreground_region_samples=None,
-                      background_region_samples=None, region_area=None):
+                      background_region_samples=None, region_area=None,
+                      foreground_condition_offset=None):
         foreground_mask = checked_mask(foreground_mask, imgs)
         if crop_box is not None and (lq_context is None or foreground_context is None):
             raise ValueError('crop training needs aligned full-image and full-mask context')
@@ -110,7 +112,11 @@ class AiLUTDual(AiLUT):
             stats = reliability * stats + (1 - reliability) * global_stats
             if not self.use_region_condition:
                 stats, region, reliability = global_stats, torch.zeros_like(region), torch.ones_like(region)
-            condition, weights, vertices, lut = self.branches[name](cnn_code, global_stats, stats, region, reliability)
+            if index == 0 and foreground_condition_offset is not None:
+                condition, weights, vertices, lut = self.branches[name](
+                    cnn_code, global_stats, stats, region, reliability, foreground_condition_offset)
+            else:
+                condition, weights, vertices, lut = self.branches[name](cnn_code, global_stats, stats, region, reliability)
             conditions.append(condition)
             weights_list.append(weights)
             vertices_list.append(vertices)
@@ -153,8 +159,11 @@ class AiLUTDual(AiLUT):
                 global_outputs=global_outputs, local_deltas=deltas,
                 context_deltas=context_deltas, delta_means=means,
                 low_coefficients=lows, local_reference=low_source,
-                local_masks=(low_mask, 1 - low_mask), statistics=stats_list)
+                local_masks=(low_mask, 1 - low_mask), statistics=stats_list, conditions=conditions)
         return output, weights, vertices
+
+    def extra_training_losses(self, aux, **kwargs):
+        return {}
 
     def forward_train(self, lq, gt, lq_context=None, context_samples=None, crop_box=None,
                       foreground_mask=None, supervision_mask=None, face_mask=None, **kwargs):
@@ -162,8 +171,10 @@ class AiLUTDual(AiLUT):
                     'background_region_samples', 'region_area')
         if lq_context is None or context_samples is None or crop_box is None or any(kwargs.get(key) is None for key in required):
             raise ValueError('training requires SemanticContextAugment with complete context and regional samples')
+        roi_keys = ('foreground_roi', 'foreground_roi_mask', 'foreground_roi_box')
+        supplied_roi = {key: kwargs[key] for key in roi_keys if kwargs.get(key) is not None}
         output, weights, vertices, aux = self.forward_dummy(lq, True, lq_context, context_samples,
-            crop_box, foreground_mask, **{key: kwargs[key] for key in required})
+            crop_box, foreground_mask, **{key: kwargs[key] for key in required}, **supplied_roi)
         supervision_mask = checked_mask(supervision_mask, lq, 'supervision_mask')
         losses = dict(loss_recons=self.recons_loss(output, gt))
         if self.color_loss_weight:
@@ -187,6 +198,7 @@ class AiLUTDual(AiLUT):
             face, _, _ = masked_per_image(color_error, face_mask, self.region_min_area)
             losses['loss_face_color'] = self.face_color_weight * face / 100.
         lab_difference = display_p3_to_lab(output) - display_p3_to_lab(gt)
+        losses.update(self.extra_training_losses(aux, **kwargs))
         for key, error in (('foreground_delta_L', lab_difference[:, :1].abs()),
                            ('foreground_delta_ab', lab_difference[:, 1:].square().sum(1).clamp_min(1e-12).sqrt())):
             losses[key] = masked_per_image(error, supervision_mask, self.region_min_area)[0].detach()
@@ -251,7 +263,8 @@ class AiLUTDual(AiLUT):
     def evaluate(self, output, gt, meta=None, foreground_mask=None, face_mask=None,
                  supervision_mask=None):
         extra_names = {'deltaE_P3_foreground', 'deltaE_P3_background', 'deltaE_P3_face',
-                       'deltaL_P3_foreground', 'deltaAB_P3_foreground'}
+                       'deltaL_P3_foreground', 'deltaAB_P3_foreground',
+                       'deltaL_P3_background', 'deltaL_P3_highlights'}
         # Use an independent ConfigDict, since inherited evaluate knows global metrics.
         original = self.test_cfg
         self.test_cfg = type(original)(dict(original))
@@ -275,11 +288,15 @@ class AiLUTDual(AiLUT):
             ('deltaE_P3_foreground', mask, color),
             ('deltaE_P3_background', 1 - mask, color),
             ('deltaL_P3_foreground', mask, lab[:, :1].abs()),
+            ('deltaL_P3_background', 1 - mask, lab[:, :1].abs()),
+            ('deltaL_P3_highlights', (display_p3_to_lab(target)[:, :1] >= 80).to(mask), lab[:, :1].abs()),
             ('deltaAB_P3_foreground', mask, lab[:, 1:].norm(dim=1))):
             if name in original.metrics:
                 value, _, valid = masked_per_image(error, region_mask, self.region_min_area)
                 result[name] = value.item()
-                result['_valid_' + ('background' if name.endswith('background') else 'foreground')] = valid.item()
+                region = ('background' if name.endswith('background') else
+                          'highlights' if name.endswith('highlights') else 'foreground')
+                result['_valid_' + region] = valid.item()
         if 'deltaE_P3_face' in original.metrics:
             face_mask = checked_mask(face_mask, pred, 'face_mask')
             value, _, valid = masked_per_image(color, face_mask, self.region_min_area)

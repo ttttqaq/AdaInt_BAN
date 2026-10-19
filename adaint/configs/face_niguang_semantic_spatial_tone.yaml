@@ -22,7 +22,7 @@ model:
   type: AiLUTDual
   lut_mode: basis
   spatial_tone_enabled: true
-  tone_curves: 3
+  tone_curves: 1
   tone_segments: 16
   tone_resolution: 128
   tone_channels: 16

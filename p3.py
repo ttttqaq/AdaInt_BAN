@@ -89,9 +89,9 @@ DEFAULT_INPUT_FOLDER = (
     / "work_dirs"
     / "face_indoor_p3_local_color_1"
     / "gen_0"
-    / "train_infer"
+    / "test_final_results"
 )
-DEFAULT_OUTPUT_FOLDER = DEFAULT_INPUT_FOLDER.with_name("train_infer_p3")
+DEFAULT_OUTPUT_FOLDER = DEFAULT_INPUT_FOLDER.with_name("test_final_infer_p3")
 
 
 def has_embedded_icc(data: bytes) -> bool:

@@ -35,6 +35,11 @@ def main():
         print('Existing cache is valid: ' + str(root))
         print(json.dumps(metrics, indent=2))
         return
+    if not Path(cfg.calibration_init_from).is_file():
+        raise FileNotFoundError('Missing scene-specific basis checkpoint: {}. '
+            'Train its basis config first: python tools/train_kd_unified.py {} '
+            '--seed {} --deterministic'.format(cfg.calibration_init_from,
+                cfg.calibration_basis_config, cfg.get('seed', 2026)))
     basis = load_config(cfg.calibration_basis_config)
     torch.set_num_threads(2)
     torch.manual_seed(cfg.get('seed', 2026))

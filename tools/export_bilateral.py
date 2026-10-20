@@ -13,13 +13,14 @@ def main():
     parser.add_argument('config')
     parser.add_argument('checkpoint')
     parser.add_argument('--out', required=True)
-    parser.add_argument('--split', choices=['train','val','both'], default='both')
+    parser.add_argument('--split', choices=['train','val','test','both'], default='both',
+                        help='both=train+val; test uses its own input-only split and mask root')
     args = parser.parse_args()
     cfg = load_config(args.config)
     if cfg.model.type != 'AiLUTBilateral':
         raise ValueError('export expects an AiLUTBilateral inference config')
     for split in (['train','val'] if args.split == 'both' else [args.split]):
-        infer_and_save_split(cfg, cfg.data[split], args.checkpoint, args.out)
+        infer_and_save_split(cfg, cfg.data[split], args.checkpoint, args.out, split=split)
 
 
 if __name__ == '__main__':

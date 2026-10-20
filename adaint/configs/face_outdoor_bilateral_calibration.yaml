@@ -1,0 +1,289 @@
+# Outdoor normal-light dataset; same joint calibration method as backlit.
+# Keep the original scene-specific split, masks and basis checkpoint.
+# data.test is the original independent LQ-only test set.
+exp_name: face_outdoor_bilateral_calibration
+custom_imports:
+  imports:
+  - adaint
+  allow_failed_imports: false
+gen: 1
+train_epochs: 30
+adaint_fix_epochs: 0
+checkpoint_interval_epochs: 1
+evaluation_interval_epochs: 1
+infer_after_generation: true
+enable_kd: false
+kdloss_type: MSELoss
+kdloss_weight: 0.1
+model:
+  type: AiLUTBilateral
+  roi_size: 128
+  roi_margin: 0.15
+  calibration_channels: 16
+  grid_spatial_nodes: 8
+  grid_lightness_nodes: 8
+  calibration_limit: 8.0
+  calibration_loss_weight: 0.2
+  calibration_scales: [1, 4, 8]
+  calibration_min_coverage: 0.05
+  calibration_magnitude_factor: 0.0001
+  calibration_smoothness_factor: 0.0001
+  keep_foreground_weight: 0.05
+  keep_background_weight: 0.2
+  keep_tau_lightness: 2.0
+  lut_mode: basis
+  n_ranks: 5
+  n_vertices: 33
+  curve_points: 16
+  stats_bins: 16
+  stats_pool_size: 64
+  condition_dim: 256
+  head_hidden_dim: 128
+  local_resolution: 128
+  local_channels: 16
+  context_size: 256
+  min_interval: 0.001
+  guided_filter_radius: 2
+  guided_filter_epsilon: 0.001
+  backbone: tpami
+  pretrained: false
+  smooth_factor: 1.0e-05
+  monotonicity_factor: 0.01
+  global_magnitude_factor: 1.0e-05
+  local_magnitude_factor: 0.001
+  local_smoothness_factor: 0.0001
+  edge_smoothness_scale: 10.0
+  color_loss_weight: 0.1
+  color_grid_size: 16
+  color_top_fraction: 0.1
+  color_hard_weight: 0.25
+  kd_decay_start_ratio: 0.3
+  kd_decay_end_ratio: 0.8
+  kd_final_weight: 0.0
+  local_enabled: true
+  use_region_condition: true
+  region_samples_size: 32
+  region_sample_mix: 0.5
+  region_min_area: 0.0001
+  foreground_rgb_weight: 0.1
+  background_rgb_weight: 0.1
+  foreground_color_weight: 0.1
+  background_color_weight: 0.1
+  face_color_weight: 0.0
+  boundary_gradient_weight: 0.0
+test_cfg:
+  metrics:
+  - PSNR
+  - deltaE_P3
+  - deltaE_P3_top
+  - deltaE_P3_foreground
+  - deltaE_P3_background
+  - deltaL_P3_foreground
+  - deltaAB_P3_foreground
+  - deltaL_P3_background
+  - deltaL_P3_highlights
+  crop_border: 0
+data:
+  workers_per_gpu: 4
+  train_dataloader:
+    samples_per_gpu: 1
+  val_dataloader:
+    samples_per_gpu: 1
+  test_dataloader:
+    samples_per_gpu: 1
+    workers_per_gpu: 1
+  train:
+    type: Face
+    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/all/2_outdoors_data
+    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/all/2_outdoors_data
+    ann_file: adaint/annfiles/Face/outdoor_train.txt
+    pipeline:
+    - type: LoadImageFromFile
+      io_backend: disk
+      key: lq
+      backend: pillow
+      channel_order: rgb
+    - type: LoadImageFromFile
+      io_backend: disk
+      key: gt
+      backend: pillow
+      channel_order: rgb
+    - type: ResizeToMatch
+      keys:
+      - lq
+      reference_key: gt
+      interpolation: area
+    - type: RandomRatioCrop
+      keys:
+      - lq
+      - gt
+      crop_ratio:
+      - 0.6
+      - 1.0
+    - type: Flip
+      keys:
+      - lq
+      - gt
+      flip_ratio: 0.5
+      direction: horizontal
+    - type: RandomColorJitter
+      keys:
+      - lq
+      brightness: 0.0
+      saturation: 0.0
+    - type: FlexibleRescaleToZeroOne
+      keys:
+      - lq
+      - gt
+      precision: 32
+    - type: ImageToTensor
+      keys:
+      - lq
+      - gt
+    - type: Collect
+      keys:
+      - lq
+      - gt
+      meta_keys:
+      - lq_path
+      - gt_path
+    test_mode: false
+    filetmpl_lq: '{}_input.jpg'
+    filetmpl_gt: '{}_gt.jpg'
+  val:
+    type: Face
+    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/all/2_outdoors_data
+    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/all/2_outdoors_data
+    ann_file: adaint/annfiles/Face/outdoor_val.txt
+    pipeline:
+    - type: LoadImageFromFile
+      io_backend: disk
+      key: lq
+      backend: pillow
+      channel_order: rgb
+    - type: LoadImageFromFile
+      io_backend: disk
+      key: gt
+      backend: pillow
+      channel_order: rgb
+    - type: ResizeToMatch
+      keys:
+      - lq
+      reference_key: gt
+      interpolation: area
+    - type: FlexibleRescaleToZeroOne
+      keys:
+      - lq
+      - gt
+      precision: 32
+    - type: ImageToTensor
+      keys:
+      - lq
+      - gt
+    - type: Collect
+      keys:
+      - lq
+      - gt
+      meta_keys:
+      - lq_path
+      - gt_path
+    test_mode: true
+    filetmpl_lq: '{}_input.jpg'
+    filetmpl_gt: '{}_gt.jpg'
+  test:
+    type: Face
+    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/all/3_test_data
+    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/all/3_test_data
+    ann_file: adaint/annfiles/Face/test.txt
+    pipeline:
+    - type: LoadImageFromFile
+      io_backend: disk
+      key: lq
+      backend: pillow
+      channel_order: rgb
+    - type: FlexibleRescaleToZeroOne
+      keys:
+      - lq
+      precision: 32
+    - type: ImageToTensor
+      keys:
+      - lq
+    - type: Collect
+      keys:
+      - lq
+      meta_keys:
+      - lq_path
+    test_mode: true
+    filetmpl_lq: '{}_input.jpg'
+    filetmpl_gt: '{}_gt.jpg'
+optimizers:
+  type: Adam
+  lr: 0.0001
+  weight_decay: 0.0
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1.0e-08
+  paramwise_cfg:
+    custom_keys:
+      backbone:
+        lr_mult: 0.02
+      branches.foreground:
+        lr_mult: 0.05
+      branches.background:
+        lr_mult: 0.02
+      local_decoder:
+        lr_mult: 0.05
+      foreground_calibration:
+        lr_mult: 1.0
+lr_config:
+  policy: CosineAnnealing
+  min_lr: 1.0e-06
+  by_epoch: false
+checkpoint_config:
+  save_optimizer: true
+evaluation:
+  save_image: false
+log_config:
+  hooks:
+  - type: LUTEpochTextLoggerHook
+visual_config: null
+dist_params:
+  backend: nccl
+log_level: INFO
+work_dir: ./work_dirs/face_outdoor_bilateral_calibration
+load_from: null
+resume_from: null
+find_unused_parameters: true
+log_interval_epochs: 1
+dataset: face
+semantic_masks:
+  region_label: face_hair_neck
+  train_foreground_root: /DB/data/yujietang/IQ-LUT/face_dataset/all/outdoor_face_masks/masks
+  val_foreground_root: /DB/data/yujietang/IQ-LUT/face_dataset/all/outdoor_face_masks/masks
+  test_foreground_root: /DB/data/yujietang/IQ-LUT/face_dataset/all/test_face_masks/masks
+  train_face_root: null
+  val_face_root: null
+  test_face_root: null
+  foreground_suffix: _face_mask
+  face_suffix: _face_mask
+  feather_radius: 1
+  perturb_probability: 0.0
+  perturb_pixels: 1
+
+best_checkpoint_metric: PSNR
+best_checkpoint_rule: greater
+dataset_split:
+  description: original outdoor train/validation lists; separate LQ-only test set
+  train_count: 85
+  val_count: 10
+  test_uses_validation: false
+
+# Offline references only; all student parameters train from step 1.
+seed: 2026
+calibration_init_from: "./work_dirs/face_outdoor_semantic_basis/gen_0/best.pth"
+calibration_basis_config: "adaint/configs/face_outdoor_semantic_basis.yaml"
+calibration_reference_dir: "./work_dirs/face_outdoor_bilateral_calibration/reference"
+foreground_exposure_probability: 0.3
+foreground_exposure_max_ev: 0.3
+calibration_selection_tolerances: {"psnr_drop": 0.05, "background_L_increase": 0.1, "highlight_L_increase": 0.1, "foreground_L_increase": 0.05}

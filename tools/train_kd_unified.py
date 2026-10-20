@@ -71,7 +71,7 @@ def parse_args():
     return args
 
 
-def infer_and_save_split(cfg, dataset_cfg, checkpoint_path, save_dir):
+def infer_and_save_split(cfg, dataset_cfg, checkpoint_path, save_dir, split=None):
     r"""Run inference with `checkpoint_path` over the images described by
     `dataset_cfg` (e.g. `cfg.data.train` or `cfg.data.val`) and save the
     enhanced outputs as `{id}_result.png` under `save_dir`.
@@ -96,7 +96,13 @@ def infer_and_save_split(cfg, dataset_cfg, checkpoint_path, save_dir):
     ]
     if cfg.model.type in ('AiLUTDual', 'AiLUTBilateral'):
         from adaint.semantic_pipeline import semantic_mask_step
-        split = 'train' if dataset_cfg.ann_file == cfg.data.train.ann_file else 'val'
+        if split is None:
+            split = next((name for name in ('train', 'val', 'test')
+                if cfg.data.get(name) and
+                dataset_cfg.ann_file == cfg.data[name].ann_file and
+                dataset_cfg.dir_lq == cfg.data[name].dir_lq), None)
+        if split not in ('train', 'val', 'test'):
+            raise ValueError('specify train/val/test to select the matching mask root')
         step = semantic_mask_step(cfg, split, training=False)
         full_res_pipeline.insert(1, step)
         mask_keys = ['foreground_mask', 'supervision_mask']
@@ -373,8 +379,8 @@ def main():
         rank, _ = get_dist_info()
         if cfg.get('infer_after_generation', True) and (not distributed or rank == 0):
             infer_save_dir = osp.join(cfg.work_dir, 'train_infer')
-            infer_and_save_split(cfg, cfg.data.train, destination_file, infer_save_dir)
-            infer_and_save_split(cfg, cfg.data.val, destination_file, infer_save_dir)
+            infer_and_save_split(cfg, cfg.data.train, destination_file, infer_save_dir, split='train')
+            infer_and_save_split(cfg, cfg.data.val, destination_file, infer_save_dir, split='val')
             print(f"gen: {gen}, 已用 best.pth 对训练集+验证集全部图片"
                  f"（满分辨率）推理完毕，结果保存在 {infer_save_dir}")
 

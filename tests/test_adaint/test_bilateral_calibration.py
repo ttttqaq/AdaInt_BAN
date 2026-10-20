@@ -267,3 +267,59 @@ def test_calibrator_can_learn_opposing_spatial_changes_and_net_brightening():
         optimizer.zero_grad();loss.backward();optimizer.step()
     assert field[...,:16].mean()< -.5 and field[...,16:].mean()>2
     assert field.mean()>.5 and field.std()>.8
+
+
+@pytest.mark.parametrize('scene,counts,color_weight',[
+    ('indoor',(67,8),.3),('outdoor',(85,10),.1)])
+def test_normal_scene_configs_keep_their_own_data_and_basis(scene,counts,color_weight):
+    cfg=load_config('adaint/configs/face_'+scene+'_bilateral_calibration.yaml')
+    basis=load_config('adaint/configs/face_'+scene+'_semantic_basis.yaml')
+    assert cfg.model.type=='AiLUTBilateral' and cfg.adaint_fix_epochs==0
+    assert cfg.model.color_loss_weight==color_weight
+    assert cfg.calibration_init_from=='./work_dirs/face_'+scene+'_semantic_basis/gen_0/best.pth'
+    assert cfg.calibration_basis_config=='adaint/configs/face_'+scene+'_semantic_basis.yaml'
+    assert cfg.calibration_reference_dir=='./work_dirs/face_'+scene+'_bilateral_calibration/reference'
+    assert (cfg.dataset_split.train_count,cfg.dataset_split.val_count)==counts
+    assert cfg.dataset_split.test_uses_validation is False
+    assert not cfg.semantic_masks.get('foreground_ignore_boxes')
+    for split in ('train','val','test'):
+        for key in ('dir_lq','dir_gt','ann_file','filetmpl_lq','filetmpl_gt'):
+            assert cfg.data[split][key]==basis.data[split][key]
+        mask=next(s for s in cfg.data[split].pipeline if s['type']=='LoadSemanticMasks')
+        assert mask['foreground_root']==cfg.semantic_masks[split+'_foreground_root']
+        references=[s for s in cfg.data[split].pipeline if s['type']=='LoadCalibrationReference']
+        assert len(references)==int(split=='train')
+    assert cfg.data.test.ann_file!=cfg.data.val.ann_file
+    assert not any(s.get('key')=='gt' for s in cfg.data.test.pipeline)
+    assert not any('gt' in s.get('keys',[]) for s in cfg.data.test.pipeline)
+    assert all(key['lr_mult']>0 for key in cfg.optimizers.paramwise_cfg.custom_keys.values())
+
+
+@pytest.mark.parametrize('explicit_split',[None,'test'])
+def test_native_blind_export_selects_test_masks_and_never_loads_gt(monkeypatch,explicit_split):
+    from tools import train_kd_unified
+    cfg=load_config('adaint/configs/face_indoor_bilateral_calibration.yaml')
+    class PipelineCaptured(Exception):pass
+    def capture(options):
+        step=next(s for s in options.pipeline if s['type']=='LoadSemanticMasks')
+        assert step['foreground_root']==cfg.semantic_masks.test_foreground_root
+        assert step['foreground_root']!=cfg.semantic_masks.val_foreground_root
+        assert not any(s.get('key')=='gt' or 'gt' in s.get('keys',[]) for s in options.pipeline)
+        assert not any(s['type'] in ('ResizeToMatch','LoadCalibrationReference','SemanticContextAugment') for s in options.pipeline)
+        raise PipelineCaptured()
+    monkeypatch.setattr(train_kd_unified,'build_dataset',capture)
+    with pytest.raises(PipelineCaptured):
+        train_kd_unified.infer_and_save_split(cfg,cfg.data.test,'unused.pth','unused',split=explicit_split)
+
+
+def test_export_cli_accepts_the_independent_blind_test_split(monkeypatch,tmp_path):
+    import sys
+    from tools import export_bilateral
+    calls=[]
+    monkeypatch.setattr(sys,'argv',['export_bilateral.py',
+        'adaint/configs/face_outdoor_bilateral_calibration.yaml','student.pth',
+        '--out',str(tmp_path),'--split','test'])
+    monkeypatch.setattr(export_bilateral,'infer_and_save_split',lambda *a,**k:calls.append((a,k)))
+    export_bilateral.main()
+    assert len(calls)==1 and calls[0][1]['split']=='test'
+    assert calls[0][0][1].ann_file.endswith('Face/test.txt')

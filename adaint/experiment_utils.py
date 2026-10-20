@@ -10,7 +10,7 @@ from mmcv import Config
 from mmcv.runner import HOOKS, Hook, get_dist_info
 from .epoch_hooks import configure_epoch_display
 
-ENHANCER_TYPES = ('AiLUT', 'AiLUTDual')
+ENHANCER_TYPES = ('AiLUT', 'AiLUTDual', 'AiLUTBilateral')
 
 
 @HOOKS.register_module()
@@ -190,5 +190,25 @@ def load_enhancer_checkpoint(model, filename):
     # A training model may already contain its frozen, separately loaded teacher.
     # Validate every enhancer key, then preserve that teacher during preflight.
     current.update(state)
+    model.load_state_dict(current, strict=True)
+    return checkpoint
+
+
+def initialize_bilateral_from_basis(model, filename):
+    """Retain EVERY basis parameter; only the new calibration namespace may be missing."""
+    if model.__class__.__name__ != 'AiLUTBilateral':
+        raise ValueError('basis calibration initialization expects AiLUTBilateral')
+    checkpoint = torch.load(filename, map_location='cpu')
+    state = checkpoint.get('state_dict', checkpoint)
+    state = {key[7:] if key.startswith('module.') else key: value for key, value in state.items()}
+    current = model.state_dict()
+    inherited = {key for key in current if not key.startswith('foreground_calibration.')}
+    missing, unexpected = sorted(inherited - set(state)), sorted(set(state) - inherited)
+    shapes = sorted(key for key in inherited & set(state) if state[key].shape != current[key].shape)
+    if missing or unexpected or shapes:
+        raise RuntimeError('incompatible basis initialization: missing={}, unexpected={}, shapes={}'.format(
+            missing, unexpected, shapes))
+    current.update(state)
+    current['cnt_iters'] = torch.zeros_like(current['cnt_iters'])
     model.load_state_dict(current, strict=True)
     return checkpoint

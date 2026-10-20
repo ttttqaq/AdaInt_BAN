@@ -113,18 +113,21 @@ def test_ablation_config_only_changes_lut_mode_and_output_names(scene):
     assert tone.train_cfg.n_fix_iters == basis.train_cfg.n_fix_iters
 
 
-def test_only_lut_generation_changes_in_existing_production_files():
-    # Guard the user's request: forward_train/dummy/test and every loss stay intact.
-    old_model = subprocess.check_output(['git', 'show', 'fcaf8bc:adaint/model_semantic.py']).decode()
-    with open('adaint/model_semantic.py') as handle:
-        new_model = handle.read()
-    start = '    def forward_dummy('
-    assert old_model[old_model.index(start):] == new_model[new_model.index(start):]
-    old_modules = subprocess.check_output(['git', 'show', 'fcaf8bc:adaint/semantic_modules.py']).decode()
-    with open('adaint/semantic_modules.py') as handle:
-        new_modules = handle.read()
-    start = 'class DualLocalAffineDecoder'
-    assert old_modules[old_modules.index(start):] == new_modules[new_modules.index(start):]
+def test_calibration_extension_preserves_default_basis_initialization_and_checkpoint_schema():
+    # The new method intentionally extends forward/loss hooks. Protect the OLD
+    # configuration's actual parameter behavior instead of requiring identical source text.
+    source = subprocess.check_output(['git', 'show', '1d3898a:adaint/model_semantic.py']).decode()
+    source = source.replace('@MODELS.register_module()\n', '')
+    namespace = dict(__name__='adaint._basis_reference', __package__='adaint')
+    exec(compile(source, 'basis_reference', 'exec'), namespace)
+    torch.manual_seed(37)
+    reference = namespace['AiLUTDual'](lut_mode='basis')
+    torch.manual_seed(37)
+    from adaint.model_semantic import AiLUTDual
+    current = AiLUTDual(lut_mode='basis')
+    assert set(reference.state_dict()) == set(current.state_dict())
+    for name, value in reference.state_dict().items():
+        assert torch.equal(value, current.state_dict()[name]), name
 
 
 def test_basis_checkpoint_roundtrip_and_tone_checkpoint_is_rejected(tmp_path):

@@ -153,8 +153,15 @@ class AiLUTDual(AiLUT):
                 global_outputs=global_outputs, local_deltas=deltas,
                 context_deltas=context_deltas, delta_means=means,
                 low_coefficients=lows, local_reference=low_source,
-                local_masks=(low_mask, 1 - low_mask), statistics=stats_list)
+                local_masks=(low_mask, 1 - low_mask), statistics=stats_list, conditions=conditions,
+                affine_fields=[(slope, offset) for _, slope, offset in local_fields] if self.local_enabled else [])
         return output, weights, vertices
+
+    def extra_forward_kwargs(self, kwargs):
+        return {}
+
+    def extra_training_losses(self, aux, **kwargs):
+        return {}
 
     def forward_train(self, lq, gt, lq_context=None, context_samples=None, crop_box=None,
                       foreground_mask=None, supervision_mask=None, face_mask=None, **kwargs):
@@ -163,7 +170,8 @@ class AiLUTDual(AiLUT):
         if lq_context is None or context_samples is None or crop_box is None or any(kwargs.get(key) is None for key in required):
             raise ValueError('training requires SemanticContextAugment with complete context and regional samples')
         output, weights, vertices, aux = self.forward_dummy(lq, True, lq_context, context_samples,
-            crop_box, foreground_mask, **{key: kwargs[key] for key in required})
+            crop_box, foreground_mask, **{key: kwargs[key] for key in required},
+            **self.extra_forward_kwargs(kwargs))
         supervision_mask = checked_mask(supervision_mask, lq, 'supervision_mask')
         losses = dict(loss_recons=self.recons_loss(output, gt))
         if self.color_loss_weight:
@@ -187,6 +195,8 @@ class AiLUTDual(AiLUT):
             face, _, _ = masked_per_image(color_error, face_mask, self.region_min_area)
             losses['loss_face_color'] = self.face_color_weight * face / 100.
         lab_difference = display_p3_to_lab(output) - display_p3_to_lab(gt)
+        losses.update(self.extra_training_losses(aux, output=output, gt=gt,
+            supervision_mask=supervision_mask, **kwargs))
         for key, error in (('foreground_delta_L', lab_difference[:, :1].abs()),
                            ('foreground_delta_ab', lab_difference[:, 1:].square().sum(1).clamp_min(1e-12).sqrt())):
             losses[key] = masked_per_image(error, supervision_mask, self.region_min_area)[0].detach()
@@ -251,7 +261,8 @@ class AiLUTDual(AiLUT):
     def evaluate(self, output, gt, meta=None, foreground_mask=None, face_mask=None,
                  supervision_mask=None):
         extra_names = {'deltaE_P3_foreground', 'deltaE_P3_background', 'deltaE_P3_face',
-                       'deltaL_P3_foreground', 'deltaAB_P3_foreground'}
+                       'deltaL_P3_foreground', 'deltaAB_P3_foreground',
+                       'deltaL_P3_background', 'deltaL_P3_highlights'}
         # Use an independent ConfigDict, since inherited evaluate knows global metrics.
         original = self.test_cfg
         self.test_cfg = type(original)(dict(original))
@@ -275,11 +286,15 @@ class AiLUTDual(AiLUT):
             ('deltaE_P3_foreground', mask, color),
             ('deltaE_P3_background', 1 - mask, color),
             ('deltaL_P3_foreground', mask, lab[:, :1].abs()),
+            ('deltaL_P3_background', 1 - mask, lab[:, :1].abs()),
+            ('deltaL_P3_highlights', (display_p3_to_lab(target)[:, :1] >= 80).to(mask), lab[:, :1].abs()),
             ('deltaAB_P3_foreground', mask, lab[:, 1:].norm(dim=1))):
             if name in original.metrics:
                 value, _, valid = masked_per_image(error, region_mask, self.region_min_area)
                 result[name] = value.item()
-                result['_valid_' + ('background' if name.endswith('background') else 'foreground')] = valid.item()
+                region = ('background' if name.endswith('background') else
+                          'highlights' if name.endswith('highlights') else 'foreground')
+                result['_valid_' + region] = valid.item()
         if 'deltaE_P3_face' in original.metrics:
             face_mask = checked_mask(face_mask, pred, 'face_mask')
             value, _, valid = masked_per_image(color, face_mask, self.region_min_area)

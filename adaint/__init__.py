@@ -21,3 +21,7 @@ from .semantic_pipeline import LoadSemanticMasks, SemanticContextAugment
 from .semantic_dataset import SemanticFace
 
 __all__ += ['AiLUTDual', 'LoadSemanticMasks', 'SemanticContextAugment', 'SemanticFace']
+
+from .model_bilateral import AiLUTBilateral
+from .calibration_pipeline import LoadCalibrationReference
+__all__ += ['AiLUTBilateral', 'LoadCalibrationReference']

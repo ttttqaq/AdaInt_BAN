@@ -19,8 +19,7 @@ class AiLUTBilateral(AiLUTDual):
                  grid_spatial_nodes=8, grid_lightness_nodes=8, calibration_limit=8.,
                  calibration_loss_weight=.2, calibration_scales=(1, 4, 8),
                  calibration_min_coverage=.05, calibration_magnitude_factor=.0001,
-                 calibration_smoothness_factor=.0001, keep_foreground_weight=.05,
-                 keep_background_weight=.2, keep_tau_lightness=2., **kwargs):
+                 calibration_smoothness_factor=.0001, **kwargs):
         if kwargs.get('lut_mode', 'basis') != 'basis' or not kwargs.get('local_enabled', True):
             raise ValueError('bilateral calibration retains complete basis LUTs and BOTH local heads')
         kwargs['lut_mode'] = 'basis'
@@ -32,15 +31,13 @@ class AiLUTBilateral(AiLUTDual):
         self.roi_size, self.roi_margin = int(roi_size), float(roi_margin)
         if not calibration_scales or any(not isinstance(s, int) or s < 1 or s > roi_size for s in calibration_scales):
             raise ValueError('invalid multiscale calibration partitions')
-        if not 0 < calibration_min_coverage <= 1 or not math.isfinite(keep_tau_lightness) or keep_tau_lightness <= 0:
-            raise ValueError('invalid cell coverage or reference quality temperature')
+        if not 0 < calibration_min_coverage <= 1:
+            raise ValueError('invalid cell coverage')
         self.calibration_scales = tuple(calibration_scales)
         self.calibration_min_coverage = float(calibration_min_coverage)
-        self.keep_tau_lightness = float(keep_tau_lightness)
         for key, value in dict(calibration_loss_weight=calibration_loss_weight,
             calibration_magnitude_factor=calibration_magnitude_factor,
-            calibration_smoothness_factor=calibration_smoothness_factor,
-            keep_foreground_weight=keep_foreground_weight, keep_background_weight=keep_background_weight).items():
+            calibration_smoothness_factor=calibration_smoothness_factor).items():
             if not math.isfinite(value) or value < 0:
                 raise ValueError(key + ' must be finite and nonnegative')
             setattr(self, key, float(value))
@@ -73,7 +70,7 @@ class AiLUTBilateral(AiLUTDual):
             background_region_samples, region_area)
         area = mask.mean((-1, -2)) if region_area is None else region_area[:, :1].to(imgs)
         active = (area >= self.region_min_area).to(imgs)[:, :, None, None]
-        # Render the ORIGINAL complete FG mapping on native ROI coordinates,
+        # Render the current complete FG mapping on native ROI coordinates,
         # using the SAME LUT, vertices, guided coefficients and full-region mean.
         # The calibration auxiliary objective cannot change this target or its inputs.
         with torch.no_grad():
@@ -101,9 +98,9 @@ class AiLUTBilateral(AiLUTDual):
 
     def forward_train(self, *args, **kwargs):
         required = ('foreground_roi', 'foreground_roi_mask', 'foreground_roi_box',
-                    'foreground_roi_gt', 'foreground_roi_supervision', 'reference_lightness')
+                    'foreground_roi_gt', 'foreground_roi_supervision')
         if any(kwargs.get(key) is None for key in required):
-            raise ValueError('bilateral training needs native ROI supervision and prepared reference cache')
+            raise ValueError('bilateral training needs aligned full-image ROI supervision')
         return super().forward_train(*args, **kwargs)
 
     def extra_training_losses(self, aux, output, gt, supervision_mask, **kwargs):
@@ -118,18 +115,6 @@ class AiLUTBilateral(AiLUTDual):
         value, errors = multiscale_calibration_loss(actual, target, roi_mask,
             self.calibration_scales, self.calibration_min_coverage)
         losses = dict(loss_calibration_multiscale=self.calibration_loss_weight * value)
-        reference = kwargs['reference_lightness'].detach()
-        if reference.shape != gt[:, :1].shape or not torch.isfinite(reference).all() or (reference < 0).any() or (reference > 1).any():
-            raise ValueError('reference_lightness must be aligned, finite L*/100 in [0,1]')
-        target_L = display_p3_to_lab(gt.clamp(0, 1))[:, :1]
-        pred_L = display_p3_to_lab(output.clamp(0, 1))[:, :1]
-        quality = torch.exp(-(reference * 100 - target_L).abs() / self.keep_tau_lightness).detach()
-        keep_error = quality * (pred_L / 100 - reference).abs()
-        for name, region, weight in [('foreground', supervision_mask, self.keep_foreground_weight),
-                                      ('background', 1 - supervision_mask, self.keep_background_weight)]:
-            keep = masked_per_image(keep_error, region, self.region_min_area)[0]
-            losses['loss_keep_' + name] = weight * keep
-            losses['keep_' + name + '_quality'] = masked_per_image(quality, region, self.region_min_area)[0].detach()
         limit = self.foreground_calibration.lightness_limit
         magnitude = masked_per_image((actual / limit).square(), roi_mask, self.region_min_area)[0]
         grid = aux['calibration_grid'] / limit

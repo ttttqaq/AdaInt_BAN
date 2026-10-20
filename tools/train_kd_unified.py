@@ -149,26 +149,6 @@ def infer_and_save_split(cfg, dataset_cfg, checkpoint_path, save_dir, split=None
             new_name = fname[:-len('_input.png')] + '_result.png'
             os.replace(osp.join(save_dir, fname), osp.join(save_dir, new_name))
 
-    if cfg.model.type == 'AiLUTBilateral':
-        # The new decoder explicitly uses encoded Display P3. Carry the input's
-        # P3 tag into PNGs, without changing their RGB numbers or GT-free inference.
-        import io
-        from PIL import Image, ImageCms
-        for entry in dataset.data_infos:
-            source = entry['lq_path']
-            with Image.open(source) as image:
-                profile = image.info.get('icc_profile')
-            if not profile:
-                continue
-            description = ImageCms.getProfileDescription(ImageCms.ImageCmsProfile(io.BytesIO(profile)))
-            if 'p3' not in description.lower():
-                raise ValueError('Bilateral calibration expects Display P3 input, got ' + description)
-            stem = osp.splitext(osp.basename(source))[0]
-            stem = stem[:-6] if stem.endswith('_input') else stem
-            target = osp.join(save_dir, stem + '_result.png')
-            with Image.open(target) as image:
-                image.save(target, icc_profile=profile)
-
 
 def build_generation_config(base_cfg, gen, work_dir, args):
     """Create an isolated config for one self-distillation generation.
@@ -219,9 +199,6 @@ def main():
     base_cfg = load_config(args.config)
     if args.seed is None:
         args.seed = base_cfg.get('seed')
-    if base_cfg.model.type == 'AiLUTBilateral':
-        from adaint.calibration_reference import validate_reference_cache
-        validate_reference_cache(base_cfg)
     if args.work_dir is not None:
         work_dir = args.work_dir
     else:
@@ -232,6 +209,9 @@ def main():
         raise ValueError('--start-gen must be within configured generations')
     for gen in range(args.start_gen, base_cfg.gen):
         cfg = build_generation_config(base_cfg, gen, work_dir, args)
+        if cfg.model.type == 'AiLUTBilateral':
+            from adaint.calibration_checkpoint import validate_scratch_start
+            validate_scratch_start(cfg)
         # set cudnn_benchmark
         if cfg.get('cudnn_benchmark', False):
             torch.backends.cudnn.benchmark = True
@@ -296,10 +276,11 @@ def main():
             cfg.model, train_cfg=cfg.train_cfg, test_cfg=cfg.test_cfg)
 
         if cfg.model.type == 'AiLUTBilateral':
-            from adaint.calibration_checkpoint import initialize_calibration_training
-            initialize_calibration_training(model, cfg)
-            logger.info('Bilateral calibration: ALL %s student parameters train from step 1; offline references only',
-                        sum(p.numel() for p in model.parameters()))
+            if model.n_fix_iters or not all(p.requires_grad for p in model.parameters()):
+                raise ValueError('scratch training requires all student parameters to be trainable')
+            logger.info('Bilateral calibration: %s trainable parameters; %s',
+                sum(p.numel() for p in model.parameters()),
+                'resume interrupted training' if cfg.get('resume_from') else 'initialize from scratch')
 
         if len(cfg.workflow) == 2:
             val_dataset = copy.deepcopy(cfg.data.val)
@@ -326,6 +307,9 @@ def main():
         meta['mmedit Version'] = __version__
         meta['seed'] = args.seed
         meta['env_info'] = env_info
+        if cfg.model.type == 'AiLUTBilateral':
+            meta['training_initialization'] = 'scratch'
+            cfg.checkpoint_config.meta['training_initialization'] = 'scratch'
         try:
             meta['code_revision'] = subprocess.check_output(
                 ['git', 'rev-parse', 'HEAD'],
@@ -357,7 +341,7 @@ def main():
         if cfg.model.type == 'AiLUTBilateral':
             from adaint.calibration_checkpoint import save_calibration_selection
             selection = save_calibration_selection(cfg, data_list, epoch_steps)
-            print('Calibration checkpoint selection: {}'.format(selection))
+            print('Scratch checkpoint selection: {}'.format(selection))
         else:
             best_score, progress, source_file = select_best_checkpoint(
                 data_list, cfg.work_dir, epoch_steps, best_metric, best_rule)

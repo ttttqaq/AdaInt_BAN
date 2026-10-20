@@ -127,7 +127,7 @@ class SemanticContextAugment:
         if results['lq'].shape != results['gt'].shape:
             raise ValueError('SemanticContextAugment must follow ResizeToMatch')
         mask_keys = [key for key in ('foreground_mask', 'supervision_mask', 'face_mask') if key in results]
-        aligned_keys = ['lq', 'gt'] + mask_keys + (['reference_lightness'] if 'reference_lightness' in results else [])
+        aligned_keys = ['lq', 'gt'] + mask_keys
         if random.random() < self.flip_ratio:
             for key in aligned_keys:
                 results[key] = np.flip(results[key], axis=1).copy()
@@ -222,7 +222,7 @@ def configure_semantic_pipeline(cfg):
         roi = cfg.model.type == 'AiLUTBilateral'
         if training and roi:
             extras += ['foreground_roi', 'foreground_roi_mask', 'foreground_roi_gt',
-                       'foreground_roi_supervision', 'reference_lightness']
+                       'foreground_roi_supervision']
         crop = next((step for step in pipeline if step['type'] == 'RandomRatioCrop'), None)
         jitter = next((step for step in pipeline if step['type'] == 'RandomColorJitter'), {})
         flip = next((step for step in pipeline if step['type'] == 'Flip'), {})
@@ -265,8 +265,6 @@ def configure_semantic_pipeline(cfg):
             # Load before augmentation, after resolution alignment.
             if kind == 'ResizeToMatch':
                 updated.append(semantic_mask_step(cfg, split, training))
-                if training and roi:
-                    updated.append(dict(type='LoadCalibrationReference', root=cfg.calibration_reference_dir))
                 inserted = True
         dataset.pipeline = updated
     return cfg

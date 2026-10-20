@@ -1,5 +1,4 @@
-"""Spatial coordinates, identity, supervised gradient routing and guarded selection."""
-import copy
+"""Spatial coordinates, identity, supervised gradient routing and scratch checkpoint selection."""
 import json
 import random
 
@@ -11,12 +10,11 @@ from mmcv import ConfigDict
 from adaint.bilateral_calibration import (ForegroundLightnessGrid, slice_lightness_grid,
     apply_lightness_residual, multiscale_calibration_loss)
 from adaint.calibration_geometry import extract_roi, sample_roi
-from adaint.calibration_pipeline import LoadCalibrationReference, perturb_foreground_exposure
-from adaint.calibration_reference import fingerprint
-from adaint.calibration_checkpoint import choose_guarded_checkpoint
+from adaint.calibration_pipeline import perturb_foreground_exposure
+from adaint.calibration_checkpoint import save_calibration_selection, validate_scratch_start
 from adaint.color import display_p3_to_lab
 from adaint.config_utils import load_config
-from adaint.experiment_utils import initialize_bilateral_from_basis, load_enhancer_checkpoint
+from adaint.experiment_utils import load_enhancer_checkpoint
 from adaint.model_bilateral import AiLUTBilateral
 from adaint.semantic_pipeline import SemanticContextAugment
 from tests.test_adaint.test_semantic_dual import small_model, batch
@@ -36,8 +34,7 @@ def calibration_batch():
     roi,mask,box=extract_roi(data['lq'],data['foreground_mask'],32,.15)
     data.update(foreground_roi=roi,foreground_roi_mask=mask,foreground_roi_box=box,
         foreground_roi_gt=sample_roi(data['gt'],box,32),
-        foreground_roi_supervision=sample_roi(data['supervision_mask'],box,32,True),
-        reference_lightness=display_p3_to_lab(data['gt'])[:,:1]/100)
+        foreground_roi_supervision=sample_roi(data['supervision_mask'],box,32,True))
     return data
 
 
@@ -115,17 +112,14 @@ def test_exposure_augmentation_is_bidirectional_preserves_background_and_headroo
     assert min(signs)<0<max(signs)
 
 
-def test_reference_flip_crop_and_roi_target_alignment_before_sampling():
+def test_flip_crop_and_roi_target_alignment_before_sampling():
     random.seed(8)
     image=np.random.RandomState(3).randint(0,220,(48,64,3)).astype(np.uint8)
     mask=np.zeros((48,64,1),np.float32);mask[4:40,9:44]=1
-    reference=np.arange(48*64,dtype=np.float32).reshape(48,64,1)/(48*64)
     result=SemanticContextAugment(context_size=32,samples_size=16,region_samples_size=8,
         roi_size=32,flip_ratio=1,brightness=0,saturation=0,exposure_probability=1)(dict(
-        lq=image.copy(),gt=image.copy(),foreground_mask=mask.copy(),supervision_mask=mask.copy(),
-        reference_lightness=reference.copy()))
+        lq=image.copy(),gt=image.copy(),foreground_mask=mask.copy(),supervision_mask=mask.copy()))
     x0,y0,x1,y1=np.rint(result['crop_box'].numpy()*[64,48,64,48]).astype(int)
-    assert np.array_equal(result['reference_lightness'],np.flip(reference,1)[y0:y1,x0:x1])
     assert np.array_equal(result['gt'],np.flip(image,1)[y0:y1,x0:x1])
     gt=torch.from_numpy(np.flip(image,1).copy()).permute(2,0,1)[None].float()/255
     expected=sample_roi(gt,result['foreground_roi_box'][None],32)
@@ -133,71 +127,78 @@ def test_reference_flip_crop_and_roi_target_alignment_before_sampling():
     assert torch.equal(expected,actual)
 
 
-def test_cached_reference_rejects_missing_changed_sources_and_wrong_shape(tmp_path):
-    (tmp_path/'1_input.jpg').write_bytes(b'input');(tmp_path/'1_gt.jpg').write_bytes(b'gt')
-    record=dict(lq_path=fingerprint(tmp_path/'1_input.jpg'),gt_path=fingerprint(tmp_path/'1_gt.jpg'),cache='1.npy')
-    (tmp_path/'manifest.json').write_text(json.dumps({'train_records':{'1':record}}))
-    np.save(str(tmp_path/'1.npy'),np.full((10,12,1),.4,np.float32))
-    loader=LoadCalibrationReference(str(tmp_path))
-    item=dict(lq_path=str(tmp_path/'1_input.jpg'),gt_path=str(tmp_path/'1_gt.jpg'),lq=np.zeros((10,12,3)))
-    assert loader(item)['reference_lightness'].mean()==pytest.approx(.4)
-    (tmp_path/'1_input.jpg').write_bytes(b'changed')
-    with pytest.raises(ValueError,match='changed'):loader(item)
-    with pytest.raises(FileNotFoundError):LoadCalibrationReference(str(tmp_path/'missing'))
+def test_scratch_initialization_is_seeded_and_never_loads_a_checkpoint(monkeypatch):
+    def forbidden_load(*args,**kwargs):raise AssertionError('scratch initialization loaded a file')
+    monkeypatch.setattr(torch,'load',forbidden_load)
+    torch.manual_seed(37);first=calibration_model()
+    torch.manual_seed(37);second=calibration_model()
+    assert all(torch.equal(v,second.state_dict()[k]) for k,v in first.state_dict().items())
+    assert first.cnt_iters==0 and first.n_fix_iters==0
+    assert all(p.requires_grad for p in first.parameters())
+    assert len(first.local_decoder.outputs)==2
+    assert first.foreground_calibration.output.weight.eq(0).all()
+    assert first.foreground_calibration.output.bias.eq(0).all()
 
 
-def test_strict_init_retains_both_original_heads_and_counter_reset(tmp_path):
-    basis=small_model(lut_mode='basis');basis.cnt_iters.fill_(100)
-    path=str(tmp_path/'basis.pth');torch.save(dict(state_dict=basis.state_dict()),path)
-    model=calibration_model();initialize_bilateral_from_basis(model,path)
-    for key,value in basis.state_dict().items():
-        if key!='cnt_iters':assert torch.equal(value,model.state_dict()[key]),key
-    assert model.cnt_iters==0 and all(p.requires_grad for p in model.parameters())
-    assert len(model.local_decoder.outputs)==2
-    state=dict(basis.state_dict());state.pop('local_decoder.outputs.0.weight')
-    torch.save(dict(state_dict=state),path)
-    with pytest.raises(RuntimeError,match='missing'):initialize_bilateral_from_basis(model,path)
-    torch.save(dict(state_dict=small_model().state_dict()),path)
-    with pytest.raises(RuntimeError,match='incompatible'):initialize_bilateral_from_basis(model,path)
-
-
-def test_new_config_is_joint_training_and_old_configs_do_not_load_references():
-    cfg=load_config('adaint/configs/face_niguang_bilateral_calibration.yaml')
-    assert cfg.adaint_fix_epochs==0 and cfg.seed==2026
-    assert any(s['type']=='LoadCalibrationReference' for s in cfg.data.train.pipeline)
-    assert not any(s['type']=='LoadCalibrationReference' for s in cfg.data.val.pipeline)
+@pytest.mark.parametrize('scene',['indoor','outdoor','niguang'])
+def test_configs_train_from_scratch_without_any_reference_pipeline(scene):
+    cfg=load_config('adaint/configs/face_'+scene+'_bilateral_calibration.yaml')
+    assert cfg.adaint_fix_epochs==0 and cfg.seed==2026 and cfg.train_epochs==100
+    assert cfg.model.pretrained is False and cfg.load_from is None and cfg.resume_from is None
+    assert cfg.work_dir=='./work_dirs/face_'+scene+'_bilateral_calibration_scratch'
+    assert not any(key in cfg for key in ('calibration_init_from','calibration_basis_config',
+                                         'calibration_reference_dir','calibration_selection_tolerances'))
+    for split in ('train','val','test'):
+        assert not any(s['type']=='LoadCalibrationReference' for s in cfg.data[split].pipeline)
+        assert not any('reference_lightness' in s.get('keys',[]) for s in cfg.data[split].pipeline)
     options=next(s for s in cfg.data.train.pipeline if s['type']=='SemanticContextAugment')
     assert options['roi_size']==128 and options['brightness']==0 and options['exposure_probability']==.3
-    old=load_config('adaint/configs/face_niguang_semantic_basis.yaml')
-    assert not any(s['type']=='LoadCalibrationReference' for s in old.data.train.pipeline)
+    assert cfg.optimizers.lr==1e-4 and cfg.optimizers.paramwise_cfg.custom_keys.adaint.lr_mult==.1
+    old=load_config('adaint/configs/face_'+scene+'_semantic_basis.yaml')
     assert next(s for s in old.data.train.pipeline if s['type']=='SemanticContextAugment').get('roi_size',0)==0
 
 
-def test_selection_rejects_background_regression_and_uses_compatible_fallback(tmp_path):
-    baseline=dict(PSNR=27.,deltaE_P3_foreground=4.,deltaL_P3_foreground=3.,
-                  deltaL_P3_background=3.5,deltaL_P3_highlights=3.)
-    tolerance=dict(psnr_drop=.05,background_L_increase=.1,highlight_L_increase=.1,foreground_L_increase=.05)
-    good=dict(mode='val',epoch=1,PSNR=27.,deltaE_P3_foreground=3.9,deltaL_P3_foreground=2.9,
-              deltaL_P3_background=3.5,deltaL_P3_highlights=3.)
-    for epoch in (1,2):(tmp_path/('epoch_%d.pth'%epoch)).touch()
-    bad=dict(good,epoch=2,deltaE_P3_foreground=3.,deltaL_P3_background=4.)
-    result=choose_guarded_checkpoint([good,bad],str(tmp_path),baseline,tolerance,76)
-    assert result['progress']==1 and not result['using_baseline_fallback']
-    for key,value in [('PSNR',26.),('deltaL_P3_background',4.),('deltaL_P3_foreground',4.),
-                      ('deltaL_P3_highlights',4.),('deltaE_P3_foreground',float('nan'))]:
-        assert choose_guarded_checkpoint([dict(good,**{key:value})],str(tmp_path),baseline,tolerance,76)['using_baseline_fallback']
-    assert choose_guarded_checkpoint([good,dict(good,PSNR=float('nan'))],str(tmp_path),baseline,tolerance,76)['using_baseline_fallback']
+def test_best_selection_only_uses_trained_checkpoints_and_handles_overwritten_resume_records(tmp_path):
+    cfg=ConfigDict(work_dir=str(tmp_path),best_checkpoint_metric='PSNR',best_checkpoint_rule='greater')
+    for epoch in (1,2):(tmp_path/('epoch_%d.pth'%epoch)).write_text(str(epoch))
+    records=[dict(mode='val',epoch=1,PSNR=27.,deltaE_P3_foreground=4.),
+             dict(mode='val',epoch=2,PSNR=26.,deltaE_P3_foreground=3.)]
+    result=save_calibration_selection(cfg,records,76)
+    assert result['training_initialization']=='scratch' and result['progress']==1
+    assert (tmp_path/'best.pth').read_text()=='1'
+    assert (tmp_path/'best_psnr.pth').read_text()=='1'
+    assert (tmp_path/'best_foreground.pth').read_text()=='2'
+    assert not (tmp_path/'initial_basis.pth').exists()
+    records.append(dict(mode='val',epoch=1,PSNR=25.,deltaE_P3_foreground=2.5))
+    result=save_calibration_selection(cfg,records,76)
+    assert result['progress']==2 and (tmp_path/'best.pth').read_text()=='2'
+    assert (tmp_path/'best_foreground.pth').read_text()=='1'
+    cfg.best_checkpoint_metric='deltaE_P3_foreground';cfg.best_checkpoint_rule='less'
+    assert save_calibration_selection(cfg,records,76)['progress']==1
+    assert 'baseline' not in json.loads((tmp_path/'best_selection.json').read_text())
+
+
+def test_scratch_start_does_not_write_initial_weights_or_mix_runs(tmp_path):
+    cfg=ConfigDict(work_dir=str(tmp_path),load_from=None,resume_from=None)
+    validate_scratch_start(cfg)
+    assert not list(tmp_path.iterdir())
+    cfg.load_from='basis.pth'
+    with pytest.raises(ValueError,match='load_from'):validate_scratch_start(cfg)
+    cfg.load_from=None;(tmp_path/'epoch_1.pth').touch()
+    with pytest.raises(ValueError,match='existing training'):validate_scratch_start(cfg)
+    cfg.resume_from=str(tmp_path/'epoch_1.pth');validate_scratch_start(cfg)
 
 
 CUDA=pytest.mark.skipif(not torch.cuda.is_available(),reason='native AiLUT CUDA')
 
 
 @CUDA
-def test_zero_grid_exactly_preserves_its_complete_basis_and_pure_background(tmp_path):
+def test_zero_grid_exactly_preserves_its_complete_basis_and_pure_background():
     basis=small_model(lut_mode='basis').cuda().eval()
     for out in basis.local_decoder.outputs:torch.nn.init.normal_(out.weight,std=.01)
-    path=str(tmp_path/'basis.pth');torch.save(dict(state_dict=basis.state_dict()),path)
-    model=calibration_model().cuda().eval();initialize_bilateral_from_basis(model,path)
+    model=calibration_model().cuda().eval()
+    # Copy a randomly created complete basis only for the identity comparison.
+    state=model.state_dict();state.update(basis.state_dict());model.load_state_dict(state,strict=True)
     data=calibration_batch()
     with torch.no_grad():
         expected=basis.forward_dummy(data['lq'],foreground_mask=data['foreground_mask'])[0]
@@ -232,14 +233,17 @@ def test_auxiliary_only_trains_calibrator_and_main_loss_reaches_all_original_pat
 
 
 @CUDA
-def test_gt_and_reference_are_not_inference_inputs_and_missing_training_data_fails():
+def test_training_needs_roi_supervision_but_no_reference_and_inference_ignores_gt():
     model=calibration_model().cuda().eval();data=calibration_batch()
-    with pytest.raises(ValueError,match='reference'):model.forward_train(**{k:v for k,v in data.items() if k!='reference_lightness'})
+    losses=model.forward_train(**data)['losses']
+    assert not any('keep_' in key for key in losses)
+    assert all(torch.isfinite(value).all() for value in losses.values())
+    with pytest.raises(ValueError,match='ROI'):model.forward_train(**{k:v for k,v in data.items() if k!='foreground_roi_gt'})
     with torch.no_grad():
         first=model.forward_dummy(data['lq'],foreground_mask=data['foreground_mask'])[0]
-        data['gt'].zero_();data['reference_lightness'].fill_(1);data['foreground_roi_gt'].fill_(1)
+        data['gt'].zero_();data['foreground_roi_gt'].fill_(1)
         second=model.forward_dummy(data['lq'],foreground_mask=data['foreground_mask'])[0]
-    assert torch.equal(first,second)
+    assert torch.allclose(first,second,atol=2e-6,rtol=0)
 
 
 @CUDA
@@ -271,14 +275,11 @@ def test_calibrator_can_learn_opposing_spatial_changes_and_net_brightening():
 
 @pytest.mark.parametrize('scene,counts,color_weight',[
     ('indoor',(67,8),.3),('outdoor',(85,10),.1)])
-def test_normal_scene_configs_keep_their_own_data_and_basis(scene,counts,color_weight):
+def test_normal_scene_configs_keep_their_original_data_and_loss_weights(scene,counts,color_weight):
     cfg=load_config('adaint/configs/face_'+scene+'_bilateral_calibration.yaml')
     basis=load_config('adaint/configs/face_'+scene+'_semantic_basis.yaml')
     assert cfg.model.type=='AiLUTBilateral' and cfg.adaint_fix_epochs==0
     assert cfg.model.color_loss_weight==color_weight
-    assert cfg.calibration_init_from=='./work_dirs/face_'+scene+'_semantic_basis/gen_0/best.pth'
-    assert cfg.calibration_basis_config=='adaint/configs/face_'+scene+'_semantic_basis.yaml'
-    assert cfg.calibration_reference_dir=='./work_dirs/face_'+scene+'_bilateral_calibration/reference'
     assert (cfg.dataset_split.train_count,cfg.dataset_split.val_count)==counts
     assert cfg.dataset_split.test_uses_validation is False
     assert not cfg.semantic_masks.get('foreground_ignore_boxes')
@@ -288,7 +289,7 @@ def test_normal_scene_configs_keep_their_own_data_and_basis(scene,counts,color_w
         mask=next(s for s in cfg.data[split].pipeline if s['type']=='LoadSemanticMasks')
         assert mask['foreground_root']==cfg.semantic_masks[split+'_foreground_root']
         references=[s for s in cfg.data[split].pipeline if s['type']=='LoadCalibrationReference']
-        assert len(references)==int(split=='train')
+        assert not references
     assert cfg.data.test.ann_file!=cfg.data.val.ann_file
     assert not any(s.get('key')=='gt' for s in cfg.data.test.pipeline)
     assert not any('gt' in s.get('keys',[]) for s in cfg.data.test.pipeline)

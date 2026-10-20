@@ -1,14 +1,14 @@
 # Backlit dataset; independent of indoor/outdoor configs.
 # Train: first 90% of numeric IDs; val: last ceil(10%).
 # No independent test split: data.test reuses validation, not a held-out test set.
-# Complete basis initialization + jointly trained foreground lightness grid.
-exp_name: face_niguang_bilateral_calibration
+# Complete basis architecture + jointly trained foreground lightness grid.
+exp_name: face_niguang_bilateral_calibration_scratch
 custom_imports:
   imports:
   - adaint
   allow_failed_imports: false
 gen: 1
-train_epochs: 30
+train_epochs: 100
 adaint_fix_epochs: 0
 checkpoint_interval_epochs: 1
 evaluation_interval_epochs: 1
@@ -29,9 +29,6 @@ model:
   calibration_min_coverage: 0.05
   calibration_magnitude_factor: 0.0001
   calibration_smoothness_factor: 0.0001
-  keep_foreground_weight: 0.05
-  keep_background_weight: 0.2
-  keep_tau_lightness: 2.0
   lut_mode: basis
   n_ranks: 5
   n_vertices: 33
@@ -241,16 +238,8 @@ optimizers:
   eps: 1.0e-08
   paramwise_cfg:
     custom_keys:
-      backbone:
-        lr_mult: 0.02
-      branches.foreground:
-        lr_mult: 0.05
-      branches.background:
-        lr_mult: 0.02
-      local_decoder:
-        lr_mult: 0.05
-      foreground_calibration:
-        lr_mult: 1.0
+      adaint:
+        lr_mult: 0.1
 lr_config:
   policy: CosineAnnealing
   min_lr: 1.0e-06
@@ -266,7 +255,7 @@ visual_config: null
 dist_params:
   backend: nccl
 log_level: INFO
-work_dir: ./work_dirs/face_niguang_bilateral_calibration
+work_dir: ./work_dirs/face_niguang_bilateral_calibration_scratch
 load_from: null
 resume_from: null
 find_unused_parameters: true
@@ -297,11 +286,7 @@ dataset_split:
   val_ratio: 0.1
   test_uses_validation: true
 
-# Offline references only; all student parameters train from step 1.
+# Train from model defaults; no pretrained checkpoint or offline cache.
 seed: 2026
-calibration_init_from: "./work_dirs/face_niguang_semantic_basis/gen_0/best.pth"
-calibration_basis_config: "adaint/configs/face_niguang_semantic_basis.yaml"
-calibration_reference_dir: "./work_dirs/face_niguang_bilateral_calibration/reference"
 foreground_exposure_probability: 0.3
 foreground_exposure_max_ev: 0.3
-calibration_selection_tolerances: {"psnr_drop": 0.05, "background_L_increase": 0.1, "highlight_L_increase": 0.1, "foreground_L_increase": 0.05}

@@ -278,6 +278,13 @@ class AiLUT(BaseModel):
                 if not sample_meta or not sample_meta[0].get('lq_path'):
                     raise ValueError('saving evaluation images requires lq_path metadata')
                 folder_name = osp.splitext(osp.basename(sample_meta[0]['lq_path']))[0]
+                save_suffix = (self.test_cfg.get('save_suffix', '')
+                               if self.test_cfg is not None else '')
+                if save_suffix:
+                    folder_name = osp.splitext(folder_name)[0]
+                    if folder_name.endswith('_input'):
+                        folder_name = folder_name[:-len('_input')]
+                    folder_name = '{}{}'.format(folder_name, save_suffix)
                 if isinstance(iteration, numbers.Number):
                     image_path = osp.join(
                         save_path, folder_name,

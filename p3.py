@@ -87,11 +87,11 @@ SUPPORTED_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp"}
 DEFAULT_INPUT_FOLDER = (
     Path(__file__).resolve().parent
     / "work_dirs"
-    / "face_niguang_semantic_basis"
+    / "face_indoor_semantic_basis"
     / "gen_0"
-    / "train_infer"
+    / "test_final_results"
 )
-DEFAULT_OUTPUT_FOLDER = DEFAULT_INPUT_FOLDER.with_name("train_infer_p3")
+DEFAULT_OUTPUT_FOLDER = DEFAULT_INPUT_FOLDER.with_name("test_final_infer_p3")
 
 
 def has_embedded_icc(data: bytes) -> bool:

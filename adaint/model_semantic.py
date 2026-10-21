@@ -13,6 +13,8 @@ from .color import p3_delta_e_map, display_p3_to_lab
 from .modules import stratified_pixels, lut_regularizations
 from .semantic_modules import (checked_mask, masked_per_image, RegionColorStatistics,
                                RegionMapping, DualLocalAffineDecoder)
+from .postprocess import (postprocess_options, ResultAwareLocalDecoder,
+                          ResidualCalibration)
 
 
 def region_samples(image, mask, size):
@@ -32,13 +34,15 @@ class AiLUTDual(AiLUT):
                  foreground_rgb_weight=.1, background_rgb_weight=.1,
                  foreground_color_weight=.1, background_color_weight=.1,
                  face_color_weight=0., boundary_gradient_weight=0.,
-                 lut_mode='tone_residual', **kwargs):
+                 lut_mode='tone_residual', postprocess=None, **kwargs):
         if lut_mode not in ('tone_residual', 'basis'):
             raise ValueError("lut_mode must be 'tone_residual' or 'basis'")
         self.lut_mode = lut_mode
         if kwargs.get('gen', 0) > 0 or kwargs.get('kd_loss') is not None:
             raise ValueError('AiLUTDual currently trains without BAN; use gen=1, enable_kd=false in config')
         super().__init__(**kwargs)
+        self.postprocess_cfg = postprocess_options(postprocess)
+        self.global_frozen = self.postprocess_cfg['freeze_global']
         self.local_enabled, self.use_region_condition = bool(local_enabled), bool(use_region_condition)
         if region_samples_size < 1 or not 0 <= region_sample_mix <= 1 or not 0 < region_min_area < .5:
             raise ValueError('invalid regional statistics settings')
@@ -64,9 +68,42 @@ class AiLUTDual(AiLUT):
         self.branches = nn.ModuleDict({name: RegionMapping(*options)
                                        for name in ('foreground', 'background')})
         if self.local_enabled:
-            self.local_decoder = DualLocalAffineDecoder(dimension,
-                kwargs.get('local_resolution', 128), kwargs.get('local_channels', 16),
-                kwargs.get('guided_filter_radius', 2), kwargs.get('guided_filter_epsilon', .001))
+            arguments = (dimension, kwargs.get('local_resolution', 128),
+                         kwargs.get('local_channels', 16), kwargs.get('guided_filter_radius', 2),
+                         kwargs.get('guided_filter_epsilon', .001))
+            if (self.postprocess_cfg['result_condition'] or self.postprocess_cfg['multiscale'] or
+                    self.postprocess_cfg['guidance'] != 'luminance'):
+                self.local_decoder = ResultAwareLocalDecoder(*arguments,
+                    result_condition=self.postprocess_cfg['result_condition'],
+                    multiscale=self.postprocess_cfg['multiscale'],
+                    guidance=self.postprocess_cfg['guidance'])
+            else:
+                self.local_decoder = DualLocalAffineDecoder(*arguments)
+        elif (self.postprocess_cfg['result_condition'] or self.postprocess_cfg['multiscale'] or
+              self.postprocess_cfg['guidance'] != 'luminance'):
+            raise ValueError('spatial postprocess options require local_enabled=true')
+        if self.postprocess_cfg['global_dc'] or self.postprocess_cfg['regional_dc']:
+            self.postprocess_calibration = ResidualCalibration(
+                self.postprocess_cfg['global_dc'], self.postprocess_cfg['regional_dc'],
+                self.postprocess_cfg['calibration_hidden'], self.postprocess_cfg['global_dc_limit'],
+                self.postprocess_cfg['regional_dc_limit'])
+        if self.postprocess_cfg['fixed_rgb_bias'] is not None:
+            self.register_buffer('postprocess_fixed_bias', torch.tensor(
+                self.postprocess_cfg['fixed_rgb_bias'], dtype=torch.float32).view(1, 3, 1, 1))
+        if self.global_frozen:
+            if not self.local_enabled and not hasattr(self, 'postprocess_calibration'):
+                raise ValueError('freeze_global needs a trainable spatial/calibration module')
+            self.backbone.requires_grad_(False)
+            self.branches.requires_grad_(False)
+            self.train(self.training)
+
+    def train(self, mode=True):
+        super().train(mode)
+        if getattr(self, 'global_frozen', False):
+            # Freezing weights alone leaves backbone Dropout stochastic.
+            self.backbone.eval()
+            self.branches.eval()
+        return self
 
     def forward_dummy(self, imgs, return_aux=False, lq_context=None, context_samples=None,
                       crop_box=None, foreground_mask=None, foreground_context=None,
@@ -117,14 +154,26 @@ class AiLUTDual(AiLUT):
             luts.append(lut)
             stats_list.append(stats)
             global_outputs.append(ailut_transform(imgs, lut, vertices))
+        context_globals = None
+        if self.postprocess_cfg['result_condition'] or hasattr(self, 'postprocess_calibration'):
+            context_globals = [ailut_transform(source, lut, vertex)
+                               for lut, vertex in zip(luts, vertices_list)]
         context_deltas, deltas, lows, outputs, means = [], [], [], [], []
+        extra_coefficients = []
         if self.local_enabled:
-            local_fields, low_source = self.local_decoder(source, conditions)
+            if isinstance(self.local_decoder, ResultAwareLocalDecoder):
+                local_fields, low_source = self.local_decoder(source, conditions, context_globals, full_mask)
+            else:
+                local_fields, low_source = self.local_decoder(source, conditions)
+                local_fields = [[field] for field in local_fields]
             low_mask = F.interpolate(full_mask, low_source.shape[-2:], mode='area')
-            for index, (low, slope, offset) in enumerate(local_fields):
-                coefficients = self.local_decoder.upsample(slope, offset, imgs, crop_box)
+            for index, fields in enumerate(local_fields):
+                low = fields[0][0]
+                coefficients = sum(self.local_decoder.upsample(slope, offset, imgs, crop_box)
+                                   for _, slope, offset in fields)
                 raw_delta = coefficients[:, :1] * global_outputs[index] + coefficients[:, 1:]
-                context_coefficients = self.local_decoder.upsample(slope, offset, low_source)
+                context_coefficients = sum(self.local_decoder.upsample(slope, offset, low_source)
+                                           for _, slope, offset in fields)
                 context_global = ailut_transform(low_source, luts[index], vertices_list[index])
                 context_raw = context_coefficients[:, :1] * context_global + context_coefficients[:, 1:]
                 mask = low_mask if index == 0 else 1 - low_mask
@@ -137,6 +186,10 @@ class AiLUTDual(AiLUT):
                 means.append(mean * active)
                 lows.append(low)
                 outputs.append(global_outputs[index] + delta)
+                for fine, _, _ in fields[1:]:
+                    reference = F.interpolate(source, fine.shape[-2:], mode='bilinear', align_corners=False)
+                    fine_mask = F.interpolate(full_mask, fine.shape[-2:], mode='area')
+                    extra_coefficients.append((fine, reference, fine_mask if index == 0 else 1 - fine_mask))
         else:
             low_source, low_mask = source, full_mask
             for global_output in global_outputs:
@@ -146,6 +199,15 @@ class AiLUTDual(AiLUT):
                 lows.append(source.new_zeros((source.size(0), 4, *source.shape[-2:])))
                 means.append(source.new_zeros((source.size(0), 3, 1, 1)))
         output = foreground_mask * outputs[0] + (1 - foreground_mask) * outputs[1]
+        d0 = output.new_zeros((output.size(0), 3, 1, 1))
+        d1 = torch.zeros_like(d0)
+        pi = full_mask.mean((-1, -2), keepdim=True)
+        if hasattr(self, 'postprocess_calibration'):
+            d0, d1, pi = self.postprocess_calibration(source, context_globals, full_mask, self.region_min_area)
+        if hasattr(self, 'postprocess_fixed_bias'):
+            d0 = d0 + self.postprocess_fixed_bias.to(output)
+        calibration_delta = d0 + (foreground_mask - pi) * d1
+        output = output + calibration_delta
         weights, vertices = torch.stack(weights_list, 1), torch.stack(vertices_list, 1)
         if return_aux:
             return output, weights, vertices, dict(
@@ -153,7 +215,10 @@ class AiLUTDual(AiLUT):
                 global_outputs=global_outputs, local_deltas=deltas,
                 context_deltas=context_deltas, delta_means=means,
                 low_coefficients=lows, local_reference=low_source,
-                local_masks=(low_mask, 1 - low_mask), statistics=stats_list)
+                local_masks=(low_mask, 1 - low_mask), statistics=stats_list,
+                extra_coefficients=extra_coefficients, calibration_delta=calibration_delta,
+                global_dc=d0, regional_dc=d1,
+                calibration_mask_variance=(full_mask - pi).square().mean((-1, -2), keepdim=True))
         return output, weights, vertices
 
     def forward_train(self, lq, gt, lq_context=None, context_samples=None, crop_box=None,
@@ -200,12 +265,25 @@ class AiLUTDual(AiLUT):
                                             self.region_min_area)[0]
                             for delta, mask in zip(aux['context_deltas'], aux['local_masks'])) / 2
             losses['loss_local_magnitude'] = self.local_magnitude_factor * magnitude
+        if hasattr(self, 'postprocess_calibration') and self.local_magnitude_factor:
+            calibration_energy = (aux['global_dc'].square().mean() +
+                                  (aux['calibration_mask_variance'] * aux['regional_dc'].square()).mean())
+            losses['loss_postprocess_magnitude'] = self.local_magnitude_factor * calibration_energy
         if self.local_enabled and self.local_smoothness_factor:
             smooth = output.new_zeros(())
             for low, mask in zip(aux['low_coefficients'], aux['local_masks']):
                 for axis in (-1, -2):
                     difference = torch.diff(low, dim=axis).square().mean(1, keepdim=True)
                     edge = torch.diff(aux['local_reference'], dim=axis).abs().mean(1, keepdim=True)
+                    lo, hi = [slice(None)] * 4, [slice(None)] * 4
+                    lo[axis], hi[axis] = slice(None, -1), slice(1, None)
+                    edge_mask = (mask[tuple(lo)] + mask[tuple(hi)]) / 2
+                    smooth += masked_per_image(difference * torch.exp(-self.edge_smoothness_scale * edge),
+                                                edge_mask, self.region_min_area)[0] / 2
+            for fine, reference, mask in aux['extra_coefficients']:
+                for axis in (-1, -2):
+                    difference = torch.diff(fine, dim=axis).square().mean(1, keepdim=True)
+                    edge = torch.diff(reference, dim=axis).abs().mean(1, keepdim=True)
                     lo, hi = [slice(None)] * 4, [slice(None)] * 4
                     lo[axis], hi[axis] = slice(None, -1), slice(1, None)
                     edge_mask = (mask[tuple(lo)] + mask[tuple(hi)]) / 2
@@ -228,11 +306,15 @@ class AiLUTDual(AiLUT):
                       local_correction_abs_mean=(foreground_mask * aux['local_deltas'][0] +
                           (1 - foreground_mask) * aux['local_deltas'][1]).detach().abs().mean(),
                       output_change=(output - lq).detach().abs().mean())
+        if hasattr(self, 'postprocess_calibration') or hasattr(self, 'postprocess_fixed_bias'):
+            losses.update(postprocess_global_dc_abs_mean=aux['global_dc'].detach().abs().mean(),
+                          postprocess_regional_dc_abs_mean=aux['regional_dc'].detach().abs().mean(),
+                          postprocess_clip_fraction=((output < 0) | (output > 1)).to(output).detach().mean())
         return dict(losses=losses, num_samples=len(gt),
                     results=dict(lq=lq.detach().cpu(), gt=gt.detach().cpu(), output=output.detach().cpu()))
 
     def train_step(self, data_batch, optimizer):
-        frozen = self.cnt_iters.item() < self.n_fix_iters
+        frozen = self.global_frozen or self.cnt_iters.item() < self.n_fix_iters
         if frozen != self.adaint_fixed:
             for branch in self.branches.values():
                 branch.adaint.requires_grad_(not frozen)

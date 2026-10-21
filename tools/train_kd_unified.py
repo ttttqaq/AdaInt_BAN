@@ -14,7 +14,7 @@ import subprocess
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mmcv
-from mmcv import Config
+from mmcv import Config, DictAction
 import torch
 from mmcv.parallel import MMDataParallel
 from mmcv.runner import get_dist_info, init_dist, load_checkpoint
@@ -28,7 +28,7 @@ from adaint.config_utils import load_config
 from adaint.experiment_utils import (
     ENHANCER_TYPES, inference_config, load_enhancer_checkpoint,
     resolve_training_schedule, save_generation_configs, configure_epoch_display,
-    select_best_checkpoint)
+    select_best_checkpoint, initialize_postprocess)
 
 
 def parse_args():
@@ -50,6 +50,8 @@ def parse_args():
     parser.add_argument('--start-gen', type=int, default=0,
                         help='start at an existing generation after interruption')
     parser.add_argument('--seed', type=int, default=None, help='random seed')
+    parser.add_argument('--cfg-options', nargs='+', action=DictAction,
+                        help='override configuration entries, e.g. model.postprocess.global_dc=False')
     parser.add_argument(
         '--deterministic',
         action='store_true',
@@ -191,6 +193,15 @@ def main():
     args = parse_args()
 
     base_cfg = load_config(args.config)
+    if args.cfg_options:
+        # Postprocess ablations do not change the already aligned data pipeline.
+        scalar_options = {'train_epochs', 'postprocess_init', 'infer_after_generation',
+                          'best_checkpoint_metric', 'best_checkpoint_rule'}
+        if any(key not in scalar_options and not key.startswith(('model.postprocess.', 'optimizers.'))
+               for key in args.cfg_options):
+            raise ValueError('--cfg-options supports postprocess/training ablations only; '
+                             'edit the source YAML for data/pipeline changes')
+        base_cfg.merge_from_dict(args.cfg_options)
     if args.work_dir is not None:
         work_dir = args.work_dir
     else:
@@ -263,6 +274,16 @@ def main():
         save_generation_configs(cfg)
         model = build_model(
             cfg.model, train_cfg=cfg.train_cfg, test_cfg=cfg.test_cfg)
+        initialization = None
+        init_path = cfg.get('postprocess_init')
+        if init_path and not cfg.get('resume_from'):
+            if cfg.get('load_from'):
+                raise ValueError('choose postprocess_init or load_from, not both')
+            initialization = initialize_postprocess(model, init_path)
+            logger.info('Postprocess initialization: %s', initialization)
+        if (getattr(model, 'global_frozen', False) and not init_path and
+                not cfg.get('resume_from') and not cfg.get('load_from')):
+            raise ValueError('freeze_global requires postprocess_init, resume_from or load_from')
 
         if len(cfg.workflow) == 2:
             val_dataset = copy.deepcopy(cfg.data.val)
@@ -289,6 +310,8 @@ def main():
         meta['mmedit Version'] = __version__
         meta['seed'] = args.seed
         meta['env_info'] = env_info
+        if initialization is not None:
+            meta['postprocess_initialization'] = initialization
         try:
             meta['code_revision'] = subprocess.check_output(
                 ['git', 'rev-parse', 'HEAD'],

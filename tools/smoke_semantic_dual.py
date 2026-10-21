@@ -13,6 +13,7 @@ from mmedit.datasets import build_dataset
 from mmedit.models import build_model
 from adaint.config_utils import load_config
 from adaint.semantic_pipeline import LoadSemanticMasks
+from adaint.experiment_utils import initialize_postprocess
 
 
 def tensor_batch(sample, device, max_side):
@@ -67,6 +68,10 @@ def main():
                                            for split, dataset in datasets.items()})))
     model = build_model(cfg.model, train_cfg=dict(total_iters=args.steps, n_fix_iters=0),
                         test_cfg=cfg.test_cfg).to(args.device)
+    if cfg.get('postprocess_init'):
+        initialize_postprocess(model, cfg.postprocess_init)
+    elif getattr(model, 'global_frozen', False):
+        raise ValueError('freeze_global smoke check requires postprocess_init')
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.optimizers.lr)
     for step in range(args.steps):
         model.train()

@@ -192,3 +192,38 @@ def load_enhancer_checkpoint(model, filename):
     current.update(state)
     model.load_state_dict(current, strict=True)
     return checkpoint
+
+
+def initialize_postprocess(model, filename):
+    """Warm start a dual enhancer, allowing only declared new postprocess keys.
+
+    Unlike resume, this resets the training counter and never loads optimizer
+    history. All original enhancer keys/shapes must match, including the old
+    spatial decoder. Inference and resume continue to use the strict loader.
+    """
+    if not hasattr(model, 'postprocess_cfg'):
+        raise ValueError('postprocess_init requires AiLUTDual')
+    checkpoint = torch.load(filename, map_location='cpu')
+    source = checkpoint.get('state_dict', checkpoint)
+    source = {key[7:] if key.startswith('module.') else key: value
+              for key, value in source.items()}
+    source = {key: value for key, value in source.items() if not key.startswith('kd_loss.')}
+    current = model.state_dict()
+    new_prefixes = ('postprocess_calibration.', 'postprocess_fixed_bias',
+                    'local_decoder.result_adapter.', 'local_decoder.pyramid_fine.',
+                    'local_decoder.pyramid_coarse.', 'local_decoder.refinement_outputs.')
+    missing = sorted(key for key in set(current) - set(source)
+                     if not key.startswith(new_prefixes))
+    unexpected = sorted(set(source) - set(current))
+    mismatches = sorted(key for key in set(source) & set(current)
+                        if source[key].shape != current[key].shape)
+    if missing or unexpected or mismatches:
+        raise RuntimeError('incompatible postprocess initialization: missing={}, unexpected={}, '
+                           'shape_mismatches={}'.format(missing, unexpected, mismatches))
+    new_keys = sorted(set(current) - set(source))
+    current.update(source)
+    current['cnt_iters'] = torch.zeros_like(current['cnt_iters'])
+    model.load_state_dict(current, strict=True)
+    return dict(checkpoint=os.path.abspath(filename), new_keys=new_keys,
+                source_revision=checkpoint.get('meta', {}).get('code_revision', 'unavailable'),
+                source_epoch=checkpoint.get('meta', {}).get('epoch'), counter_reset=True)

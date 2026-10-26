@@ -3,13 +3,13 @@
 # Train: first 90% of numeric IDs; val: last ceil(10%).
 # No independent test split: data.test reuses validation, not a held-out test set.
 # Change model.lut_mode and work_dir together for a tone_residual comparison.
-exp_name: face_niguang_semantic_postprocess
+exp_name: face_niguang_semantic_postprocess_4
 custom_imports:
   imports:
   - adaint
   allow_failed_imports: false
 gen: 1
-train_epochs: 30
+train_epochs: 100
 adaint_fix_epochs: 0
 checkpoint_interval_epochs: 1
 evaluation_interval_epochs: 1
@@ -24,13 +24,13 @@ model:
     # Each option is independent. Defaults below are the recommended first run.
     result_condition: true
     global_dc: true
-    regional_dc: false
+    regional_dc: true
     global_dc_limit: 0.08
     regional_dc_limit: 0.04
     calibration_hidden: 64
-    multiscale: false
+    multiscale: true
     guidance: luminance          # luminance or rgb (vector guided filtering)
-    freeze_global: true
+    freeze_global: false
     fixed_rgb_bias: null         # [R,G,B], alternative to learned global_dc
   n_ranks: 5
   n_vertices: 33
@@ -256,7 +256,7 @@ dist_params:
   backend: nccl
 log_level: INFO
 postprocess_init: work_dirs/face_niguang_semantic_basis/gen_0/best.pth
-work_dir: ./work_dirs/face_niguang_semantic_postprocess
+work_dir: ./work_dirs/face_niguang_semantic_postprocess_4
 load_from: null
 resume_from: null
 find_unused_parameters: true

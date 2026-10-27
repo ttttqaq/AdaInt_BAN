@@ -10,6 +10,39 @@
 没有实现新的有界局部结构、额外 LUT 专家、天空分割网络或新的颜色空间。
 这些约束是软损失，不保证所有输出都处于 `[0,1]`，实际收益须由配对验证和视觉复核确定。
 
+## 2026-10-27 已完成实验与复现入口
+
+室外七组、室内两组均已完成追加 30 epochs；清单、训练资源、选模与图像证据保存于
+`work_dirs/hg_20261027_suite/`。本次实际权重为 `over=1`、`lut_range=1`、
+`final_range=10`、`keep=0.1`，来自训练样本初始损失量级校准；范围项覆盖了脚本的通用默认值。
+验证集按预设质量容差选择室外 `range_over` 第 3 轮，文件为
+`work_dirs/hg_20261027_outdoor_range_over_s2026/gen_0/best_guard.pth`。
+`best.pth` 仍表示 PSNR 最佳权重，两者不应混用。
+
+推荐先使用已有候选结果 `work_dirs/hg_20261027_suite/candidates/range_over/`。
+重训时使用全新前缀／suite，以下命令与实际主要设置一致，不覆盖已完成实验：
+
+```bash
+CUDA_VISIBLE_DEVICES=3 ADAINT_CUDA_MEMORY_FRACTION=0.22 \
+python tools/run_highlight_guard.py \
+  --scene outdoor \
+  --source-config work_dirs/face_outdoor_semantic_postprocess/gen_0/inference_config.py \
+  --source-checkpoint work_dirs/face_outdoor_semantic_postprocess/gen_0/best.pth \
+  --suite-dir work_dirs/hg_repro_20261027_suite --prefix hg_repro_20261027 \
+  --variants range_over --epochs 30 --seed 2026 --lr 0.00002 \
+  --over-weight 1 --lut-range-weight 1 --final-range-weight 10 \
+  --keep-weight 0.1 --execute range_over
+```
+
+推理使用已保存的 `inference_config.py` 与 `best_guard.pth`；最终统计以
+`suite/candidates/range_over/val/evaluation.json` 的独立复核为准。
+训练日志使用五位小数，旧模型区域采样还存在 GPU 浮点 CDF 的微小重复前向差异，
+因而日志与独立复核数值可能略有不同。测试图没有 GT，不计算测试 PSNR 或 GT 色差。
+天空偏色和强反射并未被本轮完全解决，不能把范围软罚称为硬边界保证。
+
+室内默认继续使用原 `face_indoor_semantic_postprocess_4`。室内新实验仅作回归检查；
+虽然过亮量下降，存在个别图像质量取舍，未替换原 checkpoint。
+
 ## 兼容性与室内保护
 
 `model.highlight_guard` 可省略。默认四项新增损失权重均为 `0`，

@@ -80,6 +80,10 @@ def prepare_config(source, name, work_dir, source_checkpoint, guard, epochs,
     cfg['test_cfg'] = validation
     cfg['validation_test_cfg'] = copy.deepcopy(validation)
     cfg['data']['workers_per_gpu'] = int(workers)
+    for split in ('train', 'val', 'test'):
+        loader = cfg['data'].setdefault(split + '_dataloader', {})
+        loader['workers_per_gpu'] = int(workers)
+        loader['persistent_workers'] = workers > 0
     cfg['optimizers']['lr'] = float(learning_rate)
     cfg['lr_config'] = dict(policy='CosineAnnealing', min_lr=1e-6, by_epoch=False)
     cfg['best_checkpoint_metric'], cfg['best_checkpoint_rule'] = 'PSNR', 'greater'

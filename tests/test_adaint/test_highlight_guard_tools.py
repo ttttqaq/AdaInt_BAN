@@ -50,6 +50,16 @@ def test_variants_have_matched_scope_and_controlled_loss_switches():
     assert left==right
 
 
+def test_zero_worker_config_can_construct_synchronous_loaders():
+    cfg=prepare_config(source_config(),'unit','work_dirs/unit','best.pth',{},2,2e-5,0)
+    from torch.utils.data import DataLoader
+    for split in ('train','val','test'):
+        loader=cfg['data'][split+'_dataloader']
+        actual=DataLoader([1,2],num_workers=loader['workers_per_gpu'],
+                          persistent_workers=loader['persistent_workers'])
+        assert len(list(actual))==2
+
+
 def validation(epoch,psnr=30.,color=3.,fg=2.,over=.02):
     return dict(mode='val',epoch=epoch,PSNR=psnr,deltaE_P3=color,
         deltaE_P3_foreground=fg,highlight_over_foreground=over,

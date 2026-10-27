@@ -15,6 +15,9 @@ from .semantic_modules import (checked_mask, masked_per_image, RegionColorStatis
                                RegionMapping, DualLocalAffineDecoder)
 from .postprocess import (postprocess_options, ResultAwareLocalDecoder,
                           ResidualCalibration)
+from .highlight_guard import (guard_options, highlight_over_loss,
+                              highlight_over_statistics, range_loss,
+                              good_region_keep_loss)
 
 
 def region_samples(image, mask, size):
@@ -34,7 +37,8 @@ class AiLUTDual(AiLUT):
                  foreground_rgb_weight=.1, background_rgb_weight=.1,
                  foreground_color_weight=.1, background_color_weight=.1,
                  face_color_weight=0., boundary_gradient_weight=0.,
-                 lut_mode='tone_residual', postprocess=None, **kwargs):
+                 lut_mode='tone_residual', postprocess=None, highlight_guard=None,
+                 **kwargs):
         if lut_mode not in ('tone_residual', 'basis'):
             raise ValueError("lut_mode must be 'tone_residual' or 'basis'")
         self.lut_mode = lut_mode
@@ -42,6 +46,10 @@ class AiLUTDual(AiLUT):
             raise ValueError('AiLUTDual currently trains without BAN; use gen=1, enable_kd=false in config')
         super().__init__(**kwargs)
         self.postprocess_cfg = postprocess_options(postprocess)
+        self.highlight_guard_cfg = guard_options(highlight_guard)
+        # The reference is a training-only runtime object: never register its
+        # parameters/buffers in enhancer checkpoints or inference models.
+        object.__setattr__(self, '_guard_reference', None)
         self.global_frozen = self.postprocess_cfg['freeze_global']
         self.local_enabled, self.use_region_condition = bool(local_enabled), bool(use_region_condition)
         if region_samples_size < 1 or not 0 <= region_sample_mix <= 1 or not 0 < region_min_area < .5:
@@ -96,6 +104,17 @@ class AiLUTDual(AiLUT):
             self.backbone.requires_grad_(False)
             self.branches.requires_grad_(False)
             self.train(self.training)
+        if self.highlight_guard_cfg['trainable_scope'] == 'heads':
+            if self.global_frozen:
+                raise ValueError('highlight_guard heads conflicts with postprocess.freeze_global')
+            self.requires_grad_(False)
+            for branch in self.branches.values():
+                branch.lut_generator.head.output.requires_grad_(True)
+            if self.local_enabled:
+                self.local_decoder.outputs.requires_grad_(True)
+                if hasattr(self.local_decoder, 'refinement_outputs'):
+                    self.local_decoder.refinement_outputs.requires_grad_(True)
+            self.train(self.training)
 
     def train(self, mode=True):
         super().train(mode)
@@ -103,7 +122,39 @@ class AiLUTDual(AiLUT):
             # Freezing weights alone leaves backbone Dropout stochastic.
             self.backbone.eval()
             self.branches.eval()
+        if getattr(self, 'highlight_guard_cfg', {}).get('trainable_scope') == 'heads':
+            # Keep frozen feature extraction deterministic. Only Linear/Conv
+            # output heads train, so no frozen Dropout is accidentally active.
+            for module in self.children():
+                module.eval()
+            for branch in self.branches.values():
+                branch.lut_generator.head.output.train(mode)
+            if self.local_enabled:
+                self.local_decoder.outputs.train(mode)
+                if hasattr(self.local_decoder, 'refinement_outputs'):
+                    self.local_decoder.refinement_outputs.train(mode)
         return self
+
+    def _guard_reference_model(self, device):
+        """Lazily load a frozen reference without changing student RNG/state."""
+        reference = self._guard_reference
+        if reference is None:
+            from mmedit.models import build_model
+            from .config_utils import load_config
+            from .experiment_utils import inference_config, load_enhancer_checkpoint
+            options = self.highlight_guard_cfg
+            cfg = inference_config(load_config(options['reference_config']))
+            # Construction allocates initialized modules before strict loading;
+            # preserve RNG so anchor/no-anchor ablations share student randomness.
+            with torch.random.fork_rng(devices=[]):
+                reference = build_model(cfg.model, train_cfg=None, test_cfg=cfg.test_cfg)
+            load_enhancer_checkpoint(reference, options['reference_checkpoint'])
+            reference.requires_grad_(False)
+            reference.eval()
+            object.__setattr__(self, '_guard_reference', reference)
+        reference.to(device=device)
+        reference.eval()
+        return reference
 
     def forward_dummy(self, imgs, return_aux=False, lq_context=None, context_samples=None,
                       crop_box=None, foreground_mask=None, foreground_context=None,
@@ -162,7 +213,10 @@ class AiLUTDual(AiLUT):
         extra_coefficients = []
         if self.local_enabled:
             if isinstance(self.local_decoder, ResultAwareLocalDecoder):
-                local_fields, low_source = self.local_decoder(source, conditions, context_globals, full_mask)
+                local_context = context_globals
+                if self.highlight_guard_cfg['detach_result_condition'] and local_context is not None:
+                    local_context = [value.detach() for value in local_context]
+                local_fields, low_source = self.local_decoder(source, conditions, local_context, full_mask)
             else:
                 local_fields, low_source = self.local_decoder(source, conditions)
                 local_fields = [[field] for field in local_fields]
@@ -231,6 +285,30 @@ class AiLUTDual(AiLUT):
             crop_box, foreground_mask, **{key: kwargs[key] for key in required})
         supervision_mask = checked_mask(supervision_mask, lq, 'supervision_mask')
         losses = dict(loss_recons=self.recons_loss(output, gt))
+        guard = self.highlight_guard_cfg
+        masks = (supervision_mask, 1 - supervision_mask)
+        if guard['over_weight']:
+            over = sum(highlight_over_loss(output, gt, mask,
+                guard['top_fraction'], guard['over_margin'], self.region_min_area)
+                for mask in masks) / 2
+            losses['loss_guard_over'] = guard['over_weight'] * over
+        if guard['lut_range_weight']:
+            lut_range = sum(range_loss(lut) for lut in aux['luts']) / len(aux['luts'])
+            losses['loss_guard_lut_range'] = guard['lut_range_weight'] * lut_range
+        if guard['final_range_weight']:
+            losses['loss_guard_final_range'] = guard['final_range_weight'] * range_loss(output)
+        if guard['keep_weight']:
+            reference = self._guard_reference_model(lq.device)
+            with torch.no_grad():
+                target = reference.forward_dummy(lq, lq_context=lq_context,
+                    context_samples=context_samples, crop_box=crop_box,
+                    foreground_mask=foreground_mask,
+                    **{key: kwargs[key] for key in required})[0]
+            keep = sum(good_region_keep_loss(output, target, gt, mask,
+                guard['keep_error_threshold'], guard['over_margin'], self.region_min_area,
+                guard['top_fraction'])
+                for mask in masks) / 2
+            losses['loss_guard_keep'] = guard['keep_weight'] * keep
         if self.color_loss_weight:
             color, statistics = self.color_loss(output, gt)
             losses['loss_color'] = self.color_loss_weight * color
@@ -314,7 +392,8 @@ class AiLUTDual(AiLUT):
                     results=dict(lq=lq.detach().cpu(), gt=gt.detach().cpu(), output=output.detach().cpu()))
 
     def train_step(self, data_batch, optimizer):
-        frozen = self.global_frozen or self.cnt_iters.item() < self.n_fix_iters
+        frozen = (self.global_frozen or self.highlight_guard_cfg['trainable_scope'] == 'heads'
+                  or self.cnt_iters.item() < self.n_fix_iters)
         if frozen != self.adaint_fixed:
             for branch in self.branches.values():
                 branch.adaint.requires_grad_(not frozen)
@@ -334,14 +413,52 @@ class AiLUTDual(AiLUT):
                  supervision_mask=None):
         extra_names = {'deltaE_P3_foreground', 'deltaE_P3_background', 'deltaE_P3_face',
                        'deltaL_P3_foreground', 'deltaAB_P3_foreground'}
+        guard_names = {'raw_high_clip', 'raw_high_clip_foreground',
+                       'raw_high_clip_background', 'highlight_over_foreground',
+                       'highlight_over_background'}
+        guard_result = {}
+        requested_guard = guard_names.intersection(self.test_cfg.metrics)
+        if requested_guard:
+            # tensor2img in inherited evaluate uses an in-place CPU clamp.
+            # Capture diagnostics first; do not mistake clipped PNGs for raw RGB.
+            raw, target = output.detach().clone(), gt.detach()
+            mask = None
+            if requested_guard - {'raw_high_clip'}:
+                mask = checked_mask(supervision_mask if supervision_mask is not None
+                                    else foreground_mask, raw)
+            border = self.test_cfg.crop_border
+            if border:
+                raw, target = [value[..., border:-border, border:-border]
+                               for value in (raw, target)]
+                if mask is not None:
+                    mask = mask[..., border:-border, border:-border]
+            clipped = (raw > 1).any(1, keepdim=True).to(raw)
+            if 'raw_high_clip' in requested_guard:
+                guard_result['raw_high_clip'] = clipped.mean().item()
+            if mask is not None:
+                for name, region_mask in (('foreground', mask), ('background', 1 - mask)):
+                    metric = 'raw_high_clip_' + name
+                    if metric in requested_guard:
+                        value, _, valid = masked_per_image(clipped, region_mask, self.region_min_area)
+                        guard_result[metric] = value.item()
+                        guard_result['_valid_' + name] = valid.item()
+                    metric = 'highlight_over_' + name
+                    if metric in requested_guard:
+                        values = highlight_over_statistics(raw, target, region_mask,
+                            self.highlight_guard_cfg['top_fraction'],
+                            self.highlight_guard_cfg['over_margin'], self.region_min_area)
+                        guard_result[metric] = values['over_mean'].item()
+                        guard_result['_valid_' + name] = float(values['valid_count'].item() > 0)
         # Use an independent ConfigDict, since inherited evaluate knows global metrics.
         original = self.test_cfg
         self.test_cfg = type(original)(dict(original))
-        self.test_cfg.metrics = [name for name in original.metrics if name not in extra_names]
+        self.test_cfg.metrics = [name for name in original.metrics
+                                 if name not in extra_names | guard_names]
         try:
             result = super().evaluate(output, gt, meta)
         finally:
             self.test_cfg = original
+        result.update(guard_result)
         if not extra_names.intersection(original.metrics):
             return result
         mask = checked_mask(supervision_mask if supervision_mask is not None else foreground_mask, output)

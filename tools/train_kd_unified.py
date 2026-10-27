@@ -191,13 +191,23 @@ def build_generation_config(base_cfg, gen, work_dir, args):
 
 def main():
     args = parse_args()
+    # Optional per-process allocator budget for explicitly shared training GPUs.
+    # With no environment setting, retain the historical allocation behaviour.
+    memory_fraction = os.environ.get('ADAINT_CUDA_MEMORY_FRACTION')
+    if memory_fraction is not None:
+        memory_fraction = float(memory_fraction)
+        if not 0 < memory_fraction <= 1:
+            raise ValueError('ADAINT_CUDA_MEMORY_FRACTION must be in (0, 1]')
+        for device in range(args.gpus):
+            torch.cuda.set_per_process_memory_fraction(memory_fraction, device)
 
     base_cfg = load_config(args.config)
     if args.cfg_options:
         # Postprocess ablations do not change the already aligned data pipeline.
         scalar_options = {'train_epochs', 'postprocess_init', 'infer_after_generation',
                           'best_checkpoint_metric', 'best_checkpoint_rule'}
-        if any(key not in scalar_options and not key.startswith(('model.postprocess.', 'optimizers.'))
+        if any(key not in scalar_options and not key.startswith(
+                ('model.postprocess.', 'model.highlight_guard.', 'optimizers.'))
                for key in args.cfg_options):
             raise ValueError('--cfg-options supports postprocess/training ablations only; '
                              'edit the source YAML for data/pipeline changes')
@@ -211,6 +221,7 @@ def main():
     if not 0 <= args.start_gen < base_cfg.gen:
         raise ValueError('--start-gen must be within configured generations')
     for gen in range(args.start_gen, base_cfg.gen):
+        generation_started = time.monotonic()
         cfg = build_generation_config(base_cfg, gen, work_dir, args)
         # set cudnn_benchmark
         if cfg.get('cudnn_benchmark', False):
@@ -330,6 +341,22 @@ def main():
             validate=(not args.no_validate),
             timestamp=timestamp,
             meta=meta)
+
+        resources = dict(
+            elapsed_training_seconds=time.monotonic() - generation_started,
+            parameters=sum(parameter.numel() for parameter in model.parameters()),
+            trainable_parameters=sum(parameter.numel() for parameter in model.parameters()
+                                     if parameter.requires_grad),
+            cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
+            cuda_memory_fraction=memory_fraction,
+            code_revision=meta['code_revision'])
+        if torch.cuda.is_available():
+            resources.update(
+                gpu=torch.cuda.get_device_name(0),
+                peak_allocated_bytes=torch.cuda.max_memory_allocated(0),
+                peak_reserved_bytes=torch.cuda.max_memory_reserved(0))
+        with open(osp.join(cfg.work_dir, 'runtime_resources.json'), 'w') as handle:
+            json.dump(resources, handle, indent=2)
 
         # Include this generation's earlier validation history after a resume.
         data_list = []

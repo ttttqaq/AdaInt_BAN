@@ -138,6 +138,13 @@ def inference_config(cfg):
         cfg.get('validation_test_cfg', cfg.get('test_cfg', {})))
     result.model.pop('kd_loss', None)
     result.model.pop('gen', None)
+    if result.model.get('highlight_guard') is not None:
+        # Guard objectives, parameter scopes and teacher files are training-only.
+        # Keep metric definitions but make inference self-contained; the enhancer
+        # checkpoint has exactly the original parameter/buffer schema.
+        guard = result.model.highlight_guard
+        result.model.highlight_guard = {
+            key: guard[key] for key in ('top_fraction', 'over_margin') if key in guard}
     result.train_cfg = None
     result.test_cfg = dict(metrics=None, crop_border=0)
     for key in ('load_from', 'resume_from'):

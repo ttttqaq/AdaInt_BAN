@@ -1,3 +1,6 @@
+当前方法分支 `feature/highlight-guard__from_result-postprocess` 的实现、兼容性、消融和运行命令见
+[Highlight Guard：高光约束与受限微调](adaint/HIGHLIGHT_GUARD.md)。室内 `_4` 原模型与推理路径继续保留；下面为继承的架构说明。
+
 **AdaInt-BAN：单架构 tone/LUT 与局部修正分支**
 
 本分支 `feature/global-affine__from_lut-refinement` 只保留 `AiLUT` 一个增强模型：整图条件预测 tone、AdaInt 与完整 33³ 全局 LUT；原始 RGB 坐标查询后添加直接学习的局部仿射修正。BAN 复用相同架构的冻结教师。

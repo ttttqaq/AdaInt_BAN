@@ -4,7 +4,7 @@ import copy
 import json
 
 from tools.run_highlight_guard import guard_variant, prepare_config
-from tools.evaluate_highlight_guard import (cropped, finite_means, raw_metrics,
+from tools.evaluate_highlight_guard import (cropped, finite_means, raw_metrics, tensor_rgb,
                                             select_guard_checkpoint, select_main)
 
 
@@ -156,6 +156,30 @@ def test_raw_metrics_respect_crop_border_and_region_min_area():
     assert values['raw_high_clip_foreground'] is None
     assert raw_metrics(output,mask,crop_border=1,min_area=.1)['_valid_foreground']==1
     assert raw_metrics(output,mask,crop_border=0)['raw_high_clip']>0
+
+
+def test_tensor_rgb_matches_validation_numpy_normalization_and_nchw():
+    import numpy as np
+    import torch
+    image=np.arange(3*7*11,dtype=np.uint8).reshape(7,11,3)
+    # Equivalent to FlexibleRescale -> ImageToTensor -> one-image collate.
+    expected=torch.stack([torch.from_numpy((image.astype(np.float32)/255.).clip(0,1)).permute(2,0,1)])
+    actual=tensor_rgb(image,'cpu')
+    assert torch.equal(actual,expected)
+    assert actual.is_contiguous() and actual.stride()==expected.stride()
+
+
+def test_tensor_rgb_cuda_exactly_transfers_normalized_nchw():
+    import numpy as np
+    import torch
+    import pytest
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA is unavailable')
+    image=np.arange(256,dtype=np.uint8).reshape(16,16,1).repeat(3,axis=2)
+    expected=torch.stack([torch.from_numpy((image.astype(np.float32)/255.).clip(0,1)).permute(2,0,1)]).cuda()
+    actual=tensor_rgb(image,'cuda:0')
+    assert torch.equal(actual,expected)
+    assert actual.is_contiguous() and actual.stride()==expected.stride()
 
 
 def test_raw_save_and_separate_p3_processing_preserve_pixels(tmp_path):

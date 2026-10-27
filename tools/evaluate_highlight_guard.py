@@ -169,8 +169,16 @@ def read_rgb(path):
 
 
 def tensor_rgb(array, device):
+    """Match FlexibleRescaleToZeroOne + ImageToTensor + collate exactly.
+
+    Normalize with NumPy float32 on CPU before transfer. CUDA division can
+    differ by one ULP, and retaining HWC-derived strides selects another
+    convolution path; both are avoidable differences from validation loading.
+    """
+    import numpy as np
     import torch
-    return torch.from_numpy(array).permute(2,0,1)[None].to(device=device,dtype=torch.float32)/255.
+    normalized=(array.astype(np.float32)/255.).clip(0,1)
+    return torch.from_numpy(normalized).permute(2,0,1)[None].contiguous().to(device)
 
 
 def save_raw_png(output, path):
@@ -358,6 +366,7 @@ def evaluate_main(args):
         checkpoint=str(args.checkpoint.resolve()),checkpoint_sha256=file_hash(args.checkpoint),
         code_revision=revision,device=str(device),torch_version=torch.__version__,
         metric_protocol=dict(crop_border=border,region_min_area=min_area,
+            tensor_normalization='CPU NumPy float32 / 255, contiguous NCHW, then device transfer',
             top_fraction=cfg.model.get('highlight_guard',{}).get('top_fraction',.1),
             over_margin=cfg.model.get('highlight_guard',{}).get('over_margin',2./255.)),
         summary=finite_means(records),records=records,

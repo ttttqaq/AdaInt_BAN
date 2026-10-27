@@ -87,7 +87,7 @@ SUPPORTED_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp"}
 DEFAULT_INPUT_FOLDER = (
     Path(__file__).resolve().parent
     / "work_dirs"
-    / "face_indoor_semantic_postprocess_5"
+    / "face_outdoor_semantic_postprocess"
     / "gen_0"
     / "train_infer"
 )

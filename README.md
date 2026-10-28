@@ -1,5 +1,10 @@
-当前方法分支 `feature/highlight-guard__from_result-postprocess` 的实现、兼容性、消融和运行命令见
-[Highlight Guard：高光约束与受限微调](adaint/HIGHLIGHT_GUARD.md)。室内 `_4` 原模型与推理路径继续保留；下面为继承的架构说明。
+当前分支 `feature/highlight-guard__from_result-postprocess` 的新方法为
+[有界 LUT 与空间曲线：从零全参数训练](adaint/BOUNDED_CURVES.md)，使用
+`tools/run_bounded_curves.py` 准备室内、室外及消融实验。训练／推理先保存无 ICC PNG，
+再独立运行 `p3.py` 生成 P3 副本。
+
+之前的 [Highlight Guard：高光约束与受限微调](adaint/HIGHLIGHT_GUARD.md)
+作为历史实验保留，室内 `_4` 等旧 checkpoint 继续可用；下面为继承的架构说明。
 
 **AdaInt-BAN：单架构 tone/LUT 与局部修正分支**
 

@@ -229,6 +229,10 @@ def build_reports(suite, runs, state, summary):
         original = {split: str(baseline_root / (scene + '_' +
                     {'train': 'train_nchw', 'val': 'val_nchw', 'test': 'test_nchw'}[split]))
                     for split in SPLITS}
+        for split in SPLITS:
+            refreshed = suite / 'references' / scene / 'original' / split
+            if (refreshed / 'evaluation.json').is_file():
+                original[split] = str(refreshed)
         models.insert(0, dict(name='original', splits=original))
         if scene == 'outdoor':
             models.insert(1, dict(name='highlight_guard',

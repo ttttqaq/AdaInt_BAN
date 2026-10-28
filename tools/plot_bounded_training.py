@@ -19,10 +19,19 @@ import tempfile
 
 HISTORICAL_PSNR = {'outdoor': 25.858, 'indoor': 29.917}
 COLORS = {'legacy': '#6b7280', 'bounded': '#2563eb', 'detail': '#059669',
-          'no_result': '#dc2626', 'no_fine': '#9333ea'}
+          'no_result': '#dc2626', 'no_fine': '#9333ea', 'legacy_jitter': '#a16207'}
 LABELS = {'legacy': 'Legacy, from scratch', 'bounded': 'Bounded structure',
           'detail': 'Bounded + detail losses', 'no_result': 'Without result condition',
-          'no_fine': 'Without fine scale'}
+          'no_fine': 'Without fine scale', 'legacy_jitter': 'Legacy, original color jitter'}
+
+
+def curve_style(item, index, palette):
+    variant = item['variant']
+    label, color = LABELS.get(variant, variant), COLORS.get(variant, palette(index % 10))
+    if variant == 'bounded' and item.get('epsilon') not in (None, .001):
+        label += ' (epsilon={:g})'.format(item['epsilon'])
+        color = '#ea580c'
+    return label, color
 
 
 def finite(value):
@@ -180,6 +189,7 @@ def summarize_run(run, manifest, suite, path_maps=None):
         path_map_old=applied_map['old'] if applied_map else None,
         path_map_new=applied_map['new'] if applied_map else None,
         manifest_epochs=expected, seed=manifest.get('seed'), learning_rate=manifest.get('learning_rate'),
+        epsilon=run.get('bounded_curves', {}).get('epsilon', manifest.get('epsilon')),
         status=status, training_completed=completed,
         train_budget_logged=last_train >= expected, validation_budget_logged=last_val >= expected,
         last_train_epoch=last_train, last_val_epoch=last_val,
@@ -282,8 +292,7 @@ def plot_scene(scene, items, series, output, historical=False):
     for index, item in enumerate(items):
         records = series[item['name']]['val']
         variant = item['variant']
-        label = LABELS.get(variant, variant)
-        color = COLORS.get(variant, palette(index % 10))
+        label, color = curve_style(item, index, palette)
         for axis, (key, title, scale) in zip(axes, specifications):
             points = metric_rows(records, key)
             if points:
@@ -322,8 +331,7 @@ def plot_scene(scene, items, series, output, historical=False):
     figure, axes = plt.subplots(1, 3, figsize=(17, 4.6))
     for index, item in enumerate(items):
         records = series[item['name']]['train']
-        color = COLORS.get(item['variant'], palette(index % 10))
-        label = LABELS.get(item['variant'], item['variant'])
+        label, color = curve_style(item, index, palette)
         points = [(row['epoch'], train_loss(row)[0]) for row in records
                   if train_loss(row)[0] is not None]
         for axis, values in zip(axes, (points, metric_rows(records, 'memory'),

@@ -15,6 +15,7 @@ from .semantic_modules import (checked_mask, masked_per_image, RegionColorStatis
                                RegionMapping, DualLocalAffineDecoder)
 from .postprocess import (postprocess_options, ResultAwareLocalDecoder,
                           ResidualCalibration)
+from .safe_affine import safe_options, protect_rgb, highlight_losses, regional_mean
 
 
 def region_samples(image, mask, size):
@@ -34,7 +35,7 @@ class AiLUTDual(AiLUT):
                  foreground_rgb_weight=.1, background_rgb_weight=.1,
                  foreground_color_weight=.1, background_color_weight=.1,
                  face_color_weight=0., boundary_gradient_weight=0.,
-                 lut_mode='tone_residual', postprocess=None, **kwargs):
+                 lut_mode='tone_residual', postprocess=None, safe_affine=None, **kwargs):
         if lut_mode not in ('tone_residual', 'basis'):
             raise ValueError("lut_mode must be 'tone_residual' or 'basis'")
         self.lut_mode = lut_mode
@@ -42,6 +43,7 @@ class AiLUTDual(AiLUT):
             raise ValueError('AiLUTDual currently trains without BAN; use gen=1, enable_kd=false in config')
         super().__init__(**kwargs)
         self.postprocess_cfg = postprocess_options(postprocess)
+        self.safe_affine_cfg = safe_options(safe_affine)
         self.global_frozen = self.postprocess_cfg['freeze_global']
         self.local_enabled, self.use_region_condition = bool(local_enabled), bool(use_region_condition)
         if region_samples_size < 1 or not 0 <= region_sample_mix <= 1 or not 0 < region_min_area < .5:
@@ -208,10 +210,15 @@ class AiLUTDual(AiLUT):
             d0 = d0 + self.postprocess_fixed_bias.to(output)
         calibration_delta = d0 + (foreground_mask - pi) * d1
         output = output + calibration_delta
+        raw_output = output
+        protection = None
+        if self.safe_affine_cfg['enabled']:
+            output, protection = protect_rgb(raw_output, imgs, self.safe_affine_cfg['knee'])
         weights, vertices = torch.stack(weights_list, 1), torch.stack(vertices_list, 1)
         if return_aux:
             return output, weights, vertices, dict(
                 luts=luts, vertices=vertices_list, branch_outputs=outputs,
+                raw_output=raw_output, protection=protection,
                 global_outputs=global_outputs, local_deltas=deltas,
                 context_deltas=context_deltas, delta_means=means,
                 low_coefficients=lows, local_reference=low_source,
@@ -231,6 +238,28 @@ class AiLUTDual(AiLUT):
             crop_box, foreground_mask, **{key: kwargs[key] for key in required})
         supervision_mask = checked_mask(supervision_mask, lq, 'supervision_mask')
         losses = dict(loss_recons=self.recons_loss(output, gt))
+        safety = self.safe_affine_cfg
+        if safety['enabled']:
+            masks = (supervision_mask, 1 - supervision_mask)
+            risk = aux['protection']['risk'].detach().to(output)
+            if safety['raw_weight']:
+                raw_error = (aux['raw_output'] - gt).square().mean(1, keepdim=True)
+                losses['loss_safe_raw'] = safety['raw_weight'] * sum(
+                    regional_mean(raw_error, risk * mask) for mask in masks) / 2
+            bright, gradient = highlight_losses(output, gt, masks,
+                safety['top_fraction'], self.region_min_area)
+            if safety['highlight_weight']:
+                losses['loss_safe_highlight'] = safety['highlight_weight'] * bright
+            if safety['gradient_weight']:
+                losses['loss_safe_gradient'] = safety['gradient_weight'] * gradient
+            raw = aux['raw_output'].detach()
+            protected = ~aux['protection']['risk']
+            losses.update(safe_risk_fraction=risk.mean(),
+                safe_projection_fraction=aux['protection']['projected'].float().mean(),
+                safe_raw_clip_fraction=((raw < 0) | (raw > 1)).any(1).float().mean(),
+                safe_final_clip_fraction=((output.detach() < 0) | (output.detach() > 1)).any(1).float().mean(),
+                safe_change_abs_mean=(output.detach() - raw).abs().mean(),
+                safe_protected_max_change=((output.detach() - raw).abs() * protected).amax())
         if self.color_loss_weight:
             color, statistics = self.color_loss(output, gt)
             losses['loss_color'] = self.color_loss_weight * color

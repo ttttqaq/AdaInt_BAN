@@ -18,6 +18,8 @@ from .postprocess import (postprocess_options, ResultAwareLocalDecoder,
 from .highlight_guard import (guard_options, highlight_over_loss,
                               highlight_over_statistics, range_loss,
                               good_region_keep_loss)
+from .bounded_curves import (bounded_lut, BoundedCurveDecoder,
+                             symmetric_highlight_losses)
 
 
 def region_samples(image, mask, size):
@@ -38,6 +40,7 @@ class AiLUTDual(AiLUT):
                  foreground_color_weight=.1, background_color_weight=.1,
                  face_color_weight=0., boundary_gradient_weight=0.,
                  lut_mode='tone_residual', postprocess=None, highlight_guard=None,
+                 bounded_curves=None,
                  **kwargs):
         if lut_mode not in ('tone_residual', 'basis'):
             raise ValueError("lut_mode must be 'tone_residual' or 'basis'")
@@ -47,6 +50,35 @@ class AiLUTDual(AiLUT):
         super().__init__(**kwargs)
         self.postprocess_cfg = postprocess_options(postprocess)
         self.highlight_guard_cfg = guard_options(highlight_guard)
+        self.bounded_curve_cfg = dict(enabled=False, segments=4, epsilon=.001,
+            highlight_weight=0., gradient_weight=0., top_fraction=.1)
+        if bounded_curves is not None:
+            unknown = set(bounded_curves) - set(self.bounded_curve_cfg)
+            if unknown:
+                raise ValueError('unknown bounded_curves settings: ' + str(sorted(unknown)))
+            self.bounded_curve_cfg.update(bounded_curves)
+        curve = self.bounded_curve_cfg
+        if not isinstance(curve['enabled'], bool):
+            raise ValueError('bounded_curves.enabled must be boolean')
+        if isinstance(curve['segments'], bool) or not isinstance(curve['segments'], int) or curve['segments'] < 2:
+            raise ValueError('bounded_curves.segments must be an integer >= 2')
+        if not 0 < curve['epsilon'] < .1 or not 0 < curve['top_fraction'] <= 1:
+            raise ValueError('invalid bounded_curves epsilon or top_fraction')
+        for key in ('highlight_weight', 'gradient_weight'):
+            if not math.isfinite(curve[key]) or curve[key] < 0:
+                raise ValueError('invalid bounded_curves.' + key)
+        if curve['enabled']:
+            if lut_mode != 'basis' or self.postprocess_cfg['freeze_global']:
+                raise ValueError('bounded curves require unfrozen basis mode')
+            if any(self.postprocess_cfg[key] for key in ('global_dc', 'regional_dc', 'fixed_rgb_bias')):
+                raise ValueError('bounded curves replace DC and fixed RGB bias')
+            if (self.highlight_guard_cfg['trainable_scope'] != 'all' or
+                    self.highlight_guard_cfg['detach_result_condition'] or
+                    any(self.highlight_guard_cfg[key] for key in
+                        ('over_weight', 'lut_range_weight', 'final_range_weight', 'keep_weight'))):
+                raise ValueError('bounded curves use full training and symmetric objectives only')
+            if self.n_fix_iters:
+                raise ValueError('bounded curves require n_fix_iters=0 (all parameters train from step one)')
         # The reference is a training-only runtime object: never register its
         # parameters/buffers in enhancer checkpoints or inference models.
         object.__setattr__(self, '_guard_reference', None)
@@ -75,11 +107,23 @@ class AiLUTDual(AiLUT):
                    kwargs.get('curve_points', 16), kwargs.get('min_interval', .001), lut_mode)
         self.branches = nn.ModuleDict({name: RegionMapping(*options)
                                        for name in ('foreground', 'background')})
+        if curve['enabled']:
+            # These are small distinct logit residual bases, not RGB tables.
+            # The analytic identity prior follows the CURRENT adaptive vertices.
+            with torch.random.fork_rng(devices=[]):
+                for branch in self.branches.values():
+                    nn.init.normal_(branch.lut_generator.basis_luts, std=1e-3)
         if self.local_enabled:
             arguments = (dimension, kwargs.get('local_resolution', 128),
                          kwargs.get('local_channels', 16), kwargs.get('guided_filter_radius', 2),
                          kwargs.get('guided_filter_epsilon', .001))
-            if (self.postprocess_cfg['result_condition'] or self.postprocess_cfg['multiscale'] or
+            if curve['enabled']:
+                self.local_decoder = BoundedCurveDecoder(*arguments,
+                    result_condition=self.postprocess_cfg['result_condition'],
+                    multiscale=self.postprocess_cfg['multiscale'],
+                    guidance=self.postprocess_cfg['guidance'], segments=curve['segments'],
+                    curve_epsilon=curve['epsilon'])
+            elif (self.postprocess_cfg['result_condition'] or self.postprocess_cfg['multiscale'] or
                     self.postprocess_cfg['guidance'] != 'luminance'):
                 self.local_decoder = ResultAwareLocalDecoder(*arguments,
                     result_condition=self.postprocess_cfg['result_condition'],
@@ -199,6 +243,12 @@ class AiLUTDual(AiLUT):
             if not self.use_region_condition:
                 stats, region, reliability = global_stats, torch.zeros_like(region), torch.ones_like(region)
             condition, weights, vertices, lut = self.branches[name](cnn_code, global_stats, stats, region, reliability)
+            if self.bounded_curve_cfg['enabled']:
+                # Exact coordinate endpoints avoid accidental extrapolation from
+                # a float32 cumulative sum ending a few ULPs below one.
+                vertices = torch.cat((torch.zeros_like(vertices[..., :1]),
+                    vertices[..., 1:-1], torch.ones_like(vertices[..., -1:])), -1)
+                lut = bounded_lut(lut, vertices, self.bounded_curve_cfg['epsilon'])
             conditions.append(condition)
             weights_list.append(weights)
             vertices_list.append(vertices)
@@ -223,23 +273,34 @@ class AiLUTDual(AiLUT):
             low_mask = F.interpolate(full_mask, low_source.shape[-2:], mode='area')
             for index, fields in enumerate(local_fields):
                 low = fields[0][0]
-                coefficients = sum(self.local_decoder.upsample(slope, offset, imgs, crop_box)
-                                   for _, slope, offset in fields)
-                raw_delta = coefficients[:, :1] * global_outputs[index] + coefficients[:, 1:]
-                context_coefficients = sum(self.local_decoder.upsample(slope, offset, low_source)
-                                           for _, slope, offset in fields)
                 context_global = ailut_transform(low_source, luts[index], vertices_list[index])
-                context_raw = context_coefficients[:, :1] * context_global + context_coefficients[:, 1:]
                 mask = low_mask if index == 0 else 1 - low_mask
                 mass = mask.sum((-1, -2), keepdim=True)
                 active = ((area if index == 0 else 1 - area) >= self.region_min_area).to(imgs)[:, :, None, None]
-                mean = (context_raw * mask).sum((-1, -2), keepdim=True) / mass.clamp_min(1e-8)
-                delta = (raw_delta - mean) * active
-                context_deltas.append((context_raw - mean) * active)
+                if self.bounded_curve_cfg['enabled']:
+                    mapped = self.local_decoder.apply_fields(fields, imgs, global_outputs[index], crop_box)
+                    context_mapped = self.local_decoder.apply_fields(fields, low_source, context_global)
+                    delta = (mapped - global_outputs[index]) * active
+                    context_deltas.append((context_mapped - context_global) * active)
+                    mean = torch.zeros_like(context_global[..., :1, :1])
+                    # Use a convex bypass for tiny regions, avoiding additive
+                    # cancellation at RGB boundaries.
+                    branch_output = active * mapped + (1 - active) * global_outputs[index]
+                else:
+                    coefficients = sum(self.local_decoder.upsample(slope, offset, imgs, crop_box)
+                                       for _, slope, offset in fields)
+                    raw_delta = coefficients[:, :1] * global_outputs[index] + coefficients[:, 1:]
+                    context_coefficients = sum(self.local_decoder.upsample(slope, offset, low_source)
+                                               for _, slope, offset in fields)
+                    context_raw = context_coefficients[:, :1] * context_global + context_coefficients[:, 1:]
+                    mean = (context_raw * mask).sum((-1, -2), keepdim=True) / mass.clamp_min(1e-8)
+                    delta = (raw_delta - mean) * active
+                    context_deltas.append((context_raw - mean) * active)
+                    branch_output = global_outputs[index] + delta
                 deltas.append(delta)
                 means.append(mean * active)
                 lows.append(low)
-                outputs.append(global_outputs[index] + delta)
+                outputs.append(branch_output)
                 for fine, _, _ in fields[1:]:
                     reference = F.interpolate(source, fine.shape[-2:], mode='bilinear', align_corners=False)
                     fine_mask = F.interpolate(full_mask, fine.shape[-2:], mode='area')
@@ -287,6 +348,14 @@ class AiLUTDual(AiLUT):
         losses = dict(loss_recons=self.recons_loss(output, gt))
         guard = self.highlight_guard_cfg
         masks = (supervision_mask, 1 - supervision_mask)
+        curve = self.bounded_curve_cfg
+        if curve['enabled'] and (curve['highlight_weight'] or curve['gradient_weight']):
+            highlight, gradient = symmetric_highlight_losses(output, gt, masks,
+                curve['top_fraction'], self.region_min_area)
+            if curve['highlight_weight']:
+                losses['loss_curve_highlight'] = curve['highlight_weight'] * highlight
+            if curve['gradient_weight']:
+                losses['loss_curve_gradient'] = curve['gradient_weight'] * gradient
         if guard['over_weight']:
             over = sum(highlight_over_loss(output, gt, mask,
                 guard['top_fraction'], guard['over_margin'], self.region_min_area)

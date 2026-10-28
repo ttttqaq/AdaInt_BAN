@@ -196,12 +196,14 @@ def test_optional_features_preserve_seeded_initialization_of_common_parameters()
 @pytest.mark.parametrize('scene,count', [('indoor', 67), ('niguang', 76), ('outdoor', 85)])
 def test_config_schedule_and_inference_serialization(scene, count, tmp_path):
     cfg = load_config('adaint/configs/face_' + scene + '_semantic_postprocess.yaml')
-    assert cfg.model.postprocess.freeze_global and cfg.model.postprocess.global_dc
-    assert cfg.train_epochs == 30 and cfg.adaint_fix_epochs == 0
+    # The checked-in experiment YAMLs now jointly train for 100 epochs;
+    # the original 30-epoch frozen recommendation is historical documentation.
+    assert not cfg.model.postprocess.freeze_global and cfg.model.postprocess.global_dc
+    assert cfg.train_epochs == 100 and cfg.adaint_fix_epochs == 0
     cfg.gpus = 1
     cfg.work_dir = str(tmp_path)
     resolve_training_schedule(cfg, count)
-    assert cfg.total_iters == count * 30 and cfg.train_cfg.n_fix_iters == 0
+    assert cfg.total_iters == count * cfg.train_epochs and cfg.train_cfg.n_fix_iters == 0
     save_generation_configs(cfg)
     saved = load_config(str(tmp_path / 'inference_config.py'))
     assert saved.model.postprocess == cfg.model.postprocess

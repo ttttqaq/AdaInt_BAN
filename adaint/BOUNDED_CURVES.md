@@ -46,6 +46,7 @@ under these same data and training rules, so it is the fair comparison.
 | detail | bounded plus symmetric GT-highlight RGB MSE and gradient MSE |
 | no_result | detail without result-adapter conditioning |
 | no_fine | detail without the fine spatial scale |
+| legacy_jitter | Optional legacy control retaining source brightness/saturation jitter |
 
 The detail weights are declared starting values (highlight=1, gradient=.1).
 GT brightest 10% is selected separately in each semantic region. Positive and
@@ -82,6 +83,14 @@ Each run saves `resolved_config.py`, `inference_config.py`, epoch checkpoints,
 validation-PSNR-selected `best.pth`, logs and `runtime_resources.json` under
 `work_dirs/<prefix>_<scene>_<variant>_s2026/gen_0/`.
 
+For the augmentation control, use a separate suite/prefix and
+`--variants legacy_jitter`; this is the same original architecture and scratch
+budget, with only the source photometric jitter retained. For the endpoint
+initialization control, use another separate suite/prefix with
+`--variants bounded --epsilon .01`. This changes the shared global/local
+near-identity prior and is not a global-only ablation. Neither control uses
+validation or blind-test images during training.
+
 ## Inference and evidence
 
 ```bash
@@ -109,6 +118,12 @@ CUDA_VISIBLE_DEVICES=7 python tools/evaluate_highlight_guard.py test \
 Indoor inference uses its own config/checkpoint and `indoor_ids.txt`.
 Blind test never uses GT, training, or checkpoint selection. Canonical
 paired evaluation AREA-aligns input to GT; native exports are distinct evidence.
+Add `--native-paired` to paired evaluation to also export full-input-resolution
+images into `native_raw/` and independent `p3.py` copies into `native_raw_p3/`.
+Run native exports sequentially on a card with sufficient free memory: their
+12-megapixel spatial coefficient fields require much more memory than training
+crops or the canonical GT-size evaluation. Canonical PSNR always uses the
+paired GT size; native range statistics are reported separately.
 
 Training and inference save raw PNGs without ICC. `--p3` independently calls
 `p3.py` into `raw_p3/`, then checks the expected Display P3 profile and exact
@@ -122,7 +137,58 @@ Old warm-start experiments are historical references, not matched scratch
 controls. Final conclusions must distinguish these comparisons and report
 regressions, compute cost and unresolved cases.
 
+Checkpoint selection uses paired validation only, with test images excluded.
+The fixed 100th-epoch train/validation diagnostic answers a separate question
+about final fitting behavior; it does not silently replace validation-selected
+checkpoints. A strong validation value at an early epoch can coexist with poor
+training-set reproduction, so both are necessary for interpreting this dataset.
+
 Learning curves can be generated with `tools/plot_bounded_training.py`. It needs
 Matplotlib only for plotting; `--no-plots` writes summaries using the standard
 library. When plotting copied server logs locally, repeated `--path-map OLD=NEW`
 arguments map work-directory prefixes without changing manifests or provenance.
+
+## DB94 results, 2026-10-28
+
+Eleven 100-epoch scratch runs completed (main eight, two original-jitter
+controls, one outdoor epsilon=.01 control). Canonical best-validation outdoor
+PSNR was 27.5839 for matched legacy and 27.7826 for detail; training PSNR was
+29.6911 and 29.7636. The historical original was 25.8580 validation / 29.7405
+training. The larger validation gain over that historical model must not all be
+attributed to this structure: disabling photometric jitter is a large contributor.
+
+At the fixed 100th epoch, outdoor legacy/detail train PSNR was 30.7549/29.8321,
+and indoor legacy/detail was 32.9598/32.4457. Thus the new bounded structure has
+not achieved superior matched-budget training fitting. All new bounded variants
+had exactly zero upper/lower raw exceedance on their evaluated train/val/test
+images, but GT-relative highlight errors, foreground color tradeoffs and visible
+background color failures remain. Zero exceedance does not prove correct tone.
+
+Indoor validation-selected detail was epoch 4 (train27.7895/val29.7435), while
+the old `_4` was train31.9867/val29.9169. At epoch100, detail improved training
+to32.4457 but validation declined to29.1996. It is not an overall replacement
+for `_4`; indoor added detail losses also did not improve final training PSNR
+over plain bounded. Outdoor removing the fine scale lost .404dB validation;
+removing result conditioning lost only .069dB and improved foreground Delta E,
+so no_result remains a simpler candidate rather than a proven unnecessary part.
+These are one-seed observations, not significance or generalization claims.
+
+Main evidence is `work_dirs/bc_20261028_suite/`:
+
+- `final_review/{outdoor,indoor}/report/report.html`: all image comparisons.
+- `combined_experiment_summary.{json,csv}` and `combined_selection.json`:
+  matched controls, final-epoch diagnostics and validation-only selection.
+- `case_diagnostics/`: fixed test cases 1,16,17,30; no test GT or retuning.
+- `verification/verification_summary.json`: pre-cleanup audit of 2,245 raw/P3
+  PNG pairs, zero errors; `final_regression.log`: 133 tests passed.
+- `verification/metadata_snapshot.json`: all configurations, runtime evidence,
+  checkpoint hashes and evaluation/export records preserved before cleanup.
+
+At the user's request no further experiments were added, and poor-trial weights
+and redundant epoch checkpoints were deleted after evaluation and evidence backup.
+Retained weights are outdoor legacy best, detail best/epoch100, no_result best;
+indoor legacy best, bounded best/epoch100. Other variants retain configuration,
+metrics and display previews. See `verification/checkpoint_cleanup.json` and
+the artifact cleanup record for exact deletion/retention lists. Do not rerun an
+orchestrator against the intentionally pruned old suite; reproduce with a fresh
+prefix. Existing historical models and data were not changed.

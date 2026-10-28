@@ -3,6 +3,10 @@
 `tools/run_bounded_curves.py` 准备室内、室外及消融实验。训练／推理先保存无 ICC PNG，
 再独立运行 `p3.py` 生成 P3 副本。
 
+2026-10-28 已完成 11 组各 100 轮对照：新路径实现零越界，但相同预算的训练集拟合
+尚未超过 legacy，室内也未整体超过旧 `_4`。实际指标、失败案例和已清理产物说明见
+[实验结果与限制](adaint/BOUNDED_CURVES.md#db94-results-2026-10-28)。
+
 之前的 [Highlight Guard：高光约束与受限微调](adaint/HIGHLIGHT_GUARD.md)
 作为历史实验保留，室内 `_4` 等旧 checkpoint 继续可用；下面为继承的架构说明。
 

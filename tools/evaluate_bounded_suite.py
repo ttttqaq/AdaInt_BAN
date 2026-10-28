@@ -182,7 +182,7 @@ def summarize(suite, runs, state):
     for scene in sorted({run['scene'] for run in runs}):
         candidates, rejected = [], []
         for row in rows:
-            if row['scene'] != scene or row['split'] != 'val' or row['variant'] == 'legacy':
+            if row['scene'] != scene or row['split'] != 'val' or row['variant'].startswith('legacy'):
                 continue
             reasons = []
             if row['status'] != 'completed' or not finite(row.get('PSNR')):
@@ -405,7 +405,10 @@ def orchestrate(args):
         save_json(path, state)
         raise
     summary = summarize(suite, runs, state)
-    build_reports(suite, runs, state, summary)
+    if not getattr(args, 'no_reports', False):
+        build_reports(suite, runs, state, summary)
+    else:
+        state['reports_skipped'] = True
     state.update(finished_unix=time.time(), status='completed_with_failures' if any(
         job['status'] == 'failed' for job in state['jobs'].values()) or any(
         item['status'] == 'failed' for item in state['reports'].values()) else 'completed')
@@ -422,6 +425,8 @@ def main():
     parser.add_argument('--wait-poll', type=float, default=10.)
     parser.add_argument('--retry-failed', action='store_true',
                         help='retry failed/interrupted evaluator phases on this invocation')
+    parser.add_argument('--no-reports', action='store_true',
+                        help='evaluate and summarize a supplementary control suite only')
     args = parser.parse_args()
     if (not math.isfinite(args.memory_fraction) or not 0 < args.memory_fraction <= 1 or
             args.min_free_mb < 0 or not math.isfinite(args.wait_poll) or args.wait_poll <= 0):

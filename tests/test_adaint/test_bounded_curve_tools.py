@@ -102,7 +102,7 @@ def test_variants_isolate_structure_loss_and_decoder_ablations(generator):
     assert not legacy['bounded_curves']['enabled']
     assert legacy['postprocess']['global_dc'] and legacy['postprocess']['regional_dc']
     assert legacy['postprocess']['result_condition'] and legacy['postprocess']['multiscale']
-    for name in generator.VARIANTS[1:]:
+    for name in ('bounded', 'detail', 'no_result', 'no_fine'):
         model = configs[name]['model']
         assert model['bounded_curves']['enabled']
         assert model['bounded_curves']['segments'] == 4
@@ -120,6 +120,27 @@ def test_variants_isolate_structure_loss_and_decoder_ablations(generator):
         expected = copy.deepcopy(configs['detail'])
         expected['model']['postprocess'][changed_key] = False
         assert configs[name] == expected
+
+
+def test_legacy_jitter_only_restores_source_augmentation_and_keeps_legacy_model(generator):
+    source = source_config()
+    # Non-default values prove preservation rather than hard-coded .2/.2.
+    source['data']['train']['pipeline'][1].update(brightness=.17, saturation=.09)
+    before = copy.deepcopy(source)
+    legacy = generator.prepare_config(source, 'unit', 'work_dirs/unit', 'legacy')
+    jitter = generator.prepare_config(source, 'unit', 'work_dirs/unit', 'legacy_jitter')
+    expected = copy.deepcopy(legacy)
+    expected['data']['train']['pipeline'][1].update(brightness=.17, saturation=.09)
+    assert jitter == expected
+    assert source == before
+    assert not jitter['model']['bounded_curves']['enabled']
+    assert jitter['model']['bounded_curves']['highlight_weight'] == 0.
+    assert jitter['model']['bounded_curves']['gradient_weight'] == 0.
+    assert jitter['model']['postprocess']['global_dc']
+    assert jitter['model']['postprocess']['regional_dc']
+    assert generator.augmentation_record(jitter)['brightness'] == .17
+    assert generator.augmentation_record(jitter)['saturation'] == .09
+    assert generator.augmentation_record(legacy)['brightness'] == 0.
 
 
 def test_bounded_variant_clears_inherited_fixed_bias_and_zero_workers_are_valid(generator):
@@ -192,6 +213,8 @@ def test_cli_only_prepares_reproducible_text_artifacts_and_no_icc_export(
     assert manifest['selection']['split'] == 'val'
     assert not cli_context['launched']
     assert len(manifest['runs']) == 5
+    assert {run['variant'] for run in manifest['runs']} == set(generator.DEFAULT_VARIANTS)
+    assert 'legacy_jitter' not in {run['variant'] for run in manifest['runs']}
     for split in ('train', 'val', 'test'):
         annotation = cli_context['root'] / 'ann' / (split + '.txt')
         assert manifest['data_annotations'][split]['sha256'] == generator.sha256(annotation)
@@ -205,8 +228,27 @@ def test_cli_only_prepares_reproducible_text_artifacts_and_no_icc_export(
         assert '--p3' not in run['command'] and '--resume-from' not in run['command']
         assert run['command'][-2:] == ['--gpus', '1']
         assert not Path(run['work_dir']).exists()
+        assert run['augmentation']['brightness'] == run['augmentation']['saturation'] == 0.
+        assert manifest['augmentation']['by_variant'][run['variant']] == run['augmentation']
     files = [path for path in cli_context['suite'].rglob('*') if path.is_file()]
     assert {path.suffix for path in files} == {'.py', '.json'}
+    capsys.readouterr()
+
+
+def test_cli_records_actual_jitter_for_optional_attribution_control(
+        generator, cli_context, monkeypatch, capsys):
+    monkeypatch.setattr(sys, 'argv', sys.argv + ['--variants', 'legacy', 'legacy_jitter'])
+    generator.main()
+    manifest = json.loads((cli_context['suite'] / 'manifest_outdoor.json').read_text())
+    runs = {run['variant']: run for run in manifest['runs']}
+    assert set(runs) == {'legacy', 'legacy_jitter'}
+    for variant, expected in (('legacy', 0.), ('legacy_jitter', .2)):
+        record = runs[variant]['augmentation']
+        assert record['brightness'] == record['saturation'] == expected
+        assert manifest['augmentation']['by_variant'][variant] == record
+        cfg = runpy.run_path(runs[variant]['config'])
+        assert generator.augmentation_record(cfg) == record
+    assert not cli_context['launched']
     capsys.readouterr()
 
 

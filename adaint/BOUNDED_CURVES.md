@@ -70,6 +70,10 @@ python tools/launch_highlight_guard.py \
   work_dirs/bc_repro_suite/manifest_indoor.json \
   --gpus 0 1 2 3 4 5 6 7 --min-free-mb 7000 --memory-fraction .22 \
   --output work_dirs/bc_repro_suite/launcher
+
+# Wait for the suite, evaluate each released GPU, and create both scene reports.
+python tools/evaluate_bounded_suite.py --suite work_dirs/bc_repro_suite \
+  --memory-fraction .22 --min-free-mb 6000
 ```
 
 Use a fresh prefix/suite; the generator refuses to overwrite experiments. Its
@@ -88,9 +92,22 @@ python tools/evaluate_highlight_guard.py paired \
   --decompose --p3
 ```
 
-Use `--split train` for paired training evaluation. Test mode uses the same
-evaluator's `test` subcommand, test image/mask roots and the existing scene ID
-files. Blind test never uses GT, training, or checkpoint selection. Canonical
+Use `--split train` for paired training evaluation. A full outdoor blind-test
+command is:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 python tools/evaluate_highlight_guard.py test \
+  --config work_dirs/bc_repro_outdoor_detail_s2026/gen_0/inference_config.py \
+  --checkpoint work_dirs/bc_repro_outdoor_detail_s2026/gen_0/best.pth \
+  --input-root /DB/data/yujietang/IQ-LUT/face_dataset/test_final \
+  --mask-root /DB/data/yujietang/IQ-LUT/face_dataset/test_final_masks/masks \
+  --ids-file work_dirs/test_final/outdoor_ids.txt --device cuda:0 \
+  --memory-fraction .22 --decompose --p3 \
+  --output work_dirs/bc_repro_suite/detail/test
+```
+
+Indoor inference uses its own config/checkpoint and `indoor_ids.txt`.
+Blind test never uses GT, training, or checkpoint selection. Canonical
 paired evaluation AREA-aligns input to GT; native exports are distinct evidence.
 
 Training and inference save raw PNGs without ICC. `--p3` independently calls
@@ -104,3 +121,8 @@ reads `report_manifest.json` to build quantitative and per-image HTML evidence.
 Old warm-start experiments are historical references, not matched scratch
 controls. Final conclusions must distinguish these comparisons and report
 regressions, compute cost and unresolved cases.
+
+Learning curves can be generated with `tools/plot_bounded_training.py`. It needs
+Matplotlib only for plotting; `--no-plots` writes summaries using the standard
+library. When plotting copied server logs locally, repeated `--path-map OLD=NEW`
+arguments map work-directory prefixes without changing manifests or provenance.

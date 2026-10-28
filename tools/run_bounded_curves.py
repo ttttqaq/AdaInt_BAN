@@ -20,7 +20,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-VARIANTS = ('legacy', 'bounded', 'detail', 'no_result', 'no_fine')
+DEFAULT_VARIANTS = ('legacy', 'bounded', 'detail', 'no_result', 'no_fine')
+VARIANTS = DEFAULT_VARIANTS + ('legacy_jitter',)
 PARENT_REVISION = 'af1616db97fa9e2a8c457901c22ac42a765064e3'
 GUARD_METRICS = ('raw_high_clip', 'raw_high_clip_foreground',
                  'raw_high_clip_background', 'highlight_over_foreground',
@@ -81,15 +82,16 @@ def prepare_config(source, name, work_dir, variant, epochs=100,
         keep_error_threshold=.03, reference_config=None,
         reference_checkpoint=None, trainable_scope='all',
         detach_result_condition=False)
+    legacy = variant in ('legacy', 'legacy_jitter')
     detail = variant in ('detail', 'no_result', 'no_fine')
     model['bounded_curves'] = dict(
-        enabled=variant != 'legacy', segments=int(segments), epsilon=float(epsilon),
+        enabled=not legacy, segments=int(segments), epsilon=float(epsilon),
         highlight_weight=float(highlight_weight) if detail else 0.,
         gradient_weight=float(gradient_weight) if detail else 0.,
         top_fraction=float(top_fraction))
     postprocess = model['postprocess']
     postprocess['freeze_global'] = False
-    if variant != 'legacy':
+    if not legacy:
         postprocess.update(global_dc=False, regional_dc=False, fixed_rgb_bias=None)
     if variant == 'no_result':
         postprocess['result_condition'] = False
@@ -99,7 +101,8 @@ def prepare_config(source, name, work_dir, variant, epochs=100,
     augmentations = 0
     for step in cfg['data']['train']['pipeline']:
         if step['type'] == 'SemanticContextAugment':
-            step.update(brightness=0., saturation=0.)
+            if variant != 'legacy_jitter':
+                step.update(brightness=0., saturation=0.)
             augmentations += 1
         elif step['type'] == 'RandomColorJitter':
             raise ValueError('source pipeline must first be resolved by load_config')
@@ -167,6 +170,14 @@ def code_revision():
         return 'unavailable'
 
 
+def augmentation_record(cfg):
+    step = next(step for step in cfg['data']['train']['pipeline']
+                if step['type'] == 'SemanticContextAugment')
+    return dict(brightness=step.get('brightness', .2),
+                saturation=step.get('saturation', .2),
+                geometry='unchanged from saved source config')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--scene', choices=('indoor', 'outdoor'), required=True)
@@ -175,7 +186,7 @@ def main():
     parser.add_argument('--suite-dir', type=Path,
                         default=Path('work_dirs/bc_20261028_suite'))
     parser.add_argument('--prefix', default='bc_20261028')
-    parser.add_argument('--variants', nargs='+', choices=VARIANTS, default=list(VARIANTS))
+    parser.add_argument('--variants', nargs='+', choices=VARIANTS, default=list(DEFAULT_VARIANTS))
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--seed', type=int, default=2026)
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -237,6 +248,7 @@ def main():
                          shell_command=' '.join(shlex.quote(part) for part in command),
                          bounded_curves=cfg['model']['bounded_curves'],
                          postprocess=cfg['model']['postprocess'],
+                         augmentation=augmentation_record(cfg),
                          initialization='from_scratch'))
         configs.append((cfg_path, cfg))
 
@@ -250,11 +262,14 @@ def main():
         top_fraction=args.top_fraction, data_annotations=annotations,
         data_annotation_hashes={split: row['sha256'] for split, row in annotations.items()},
         semantic_masks=plain(source.get('semantic_masks', {})),
-        augmentation=dict(brightness=0., saturation=0.,
-                          geometry='unchanged from saved source config'),
+        augmentation=dict(
+            by_variant={run['variant']: run['augmentation'] for run in runs},
+            geometry='unchanged from saved source config'),
         selection=dict(metric='PSNR', rule='greater', split='val'),
         note='All runs train from scratch with all model parameters enabled, identical data, '
-             'seed and budget. No checkpoint, frozen teacher or jitter is used. '
+             'seed and budget. No checkpoint or frozen teacher is used. '
+             'Optional legacy_jitter retains the source brightness/saturation jitter; '
+             'all other variants disable it. Actual per-run jitter is recorded. '
              'Detail loss weights are declared experimental starting values. '
              'Inference exports raw PNG; P3 ICC is a separate p3.py step.', runs=runs)
     # All paths, annotation hashes and configs were checked before the first write.

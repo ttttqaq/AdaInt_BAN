@@ -12,6 +12,7 @@ import csv
 from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
 import tempfile
 
@@ -92,8 +93,39 @@ def train_loss(row):
     return (sum(terms), 'sum of logged loss_* terms') if terms else (None, None)
 
 
-def resolve_work_dir(run, suite):
-    path = Path(run['work_dir']).expanduser()
+def parse_path_maps(values):
+    """Parse repeated prefix mappings without modifying the copied manifests."""
+    mappings = []
+    for value in values:
+        old, separator, new = value.partition('=')
+        if not separator or not old.strip() or not new.strip():
+            raise ValueError('--path-map must have nonempty OLD=NEW paths')
+        old = Path(os.path.normpath(str(Path(old).expanduser())))
+        new = Path(new).expanduser().resolve()
+        record = dict(old=str(old), new=str(new))
+        existing = next((mapping for mapping in mappings if mapping['old'] == record['old']), None)
+        if existing and existing != record:
+            raise ValueError('conflicting --path-map values for ' + record['old'])
+        if not existing:
+            mappings.append(record)
+    return sorted(mappings, key=lambda mapping: len(Path(mapping['old']).parts), reverse=True)
+
+
+def apply_path_maps(path, mappings):
+    """Match complete path components; select the longest OLD prefix once."""
+    path = Path(os.path.normpath(str(path.expanduser())))
+    for mapping in sorted(mappings or [],
+                          key=lambda value: len(Path(value['old']).parts), reverse=True):
+        try:
+            relative = path.relative_to(Path(mapping['old']))
+        except ValueError:
+            continue
+        return Path(mapping['new']) / relative, mapping
+    return path, None
+
+
+def resolve_work_dir(run, suite, path_maps=None):
+    path, _ = apply_path_maps(Path(run['work_dir']), path_maps)
     if not path.is_absolute():
         # Generated manifests normally store absolute paths. Relative work_dirs
         # are repository-relative; suite-local copied fixtures are also supported.
@@ -103,8 +135,12 @@ def resolve_work_dir(run, suite):
     return path.resolve()
 
 
-def summarize_run(run, manifest, suite):
-    work_dir = resolve_work_dir(run, suite)
+def summarize_run(run, manifest, suite, path_maps=None):
+    work_dir = resolve_work_dir(run, suite, path_maps)
+    _, applied_map = apply_path_maps(Path(run['work_dir']), path_maps)
+    original_work_dir = Path(run['work_dir'])
+    original_generation = (original_work_dir if original_work_dir.name == 'gen_0'
+                           else original_work_dir / 'gen_0')
     generation = work_dir if work_dir.name == 'gen_0' else work_dir / 'gen_0'
     records, log_paths, warnings, overwritten = load_logs(generation)
     expected = int(manifest.get('epochs', 100))
@@ -139,7 +175,10 @@ def summarize_run(run, manifest, suite):
     item = dict(
         scene=manifest.get('scene'), variant=run.get('variant', run.get('name')),
         name=run.get('name'), initialization=run.get('initialization', manifest.get('initialization')),
+        original_work_dir=run['work_dir'], original_generation_dir=str(original_generation),
         work_dir=str(work_dir), generation_dir=str(generation),
+        path_map_old=applied_map['old'] if applied_map else None,
+        path_map_new=applied_map['new'] if applied_map else None,
         manifest_epochs=expected, seed=manifest.get('seed'), learning_rate=manifest.get('learning_rate'),
         status=status, training_completed=completed,
         train_budget_logged=last_train >= expected, validation_budget_logged=last_val >= expected,
@@ -154,6 +193,8 @@ def summarize_run(run, manifest, suite):
         raw_high_clip_percent_at_best_PSNR=(100. * finite(best.get('raw_high_clip'))
             if best and finite(best.get('raw_high_clip')) is not None else None),
         best_epoch_checkpoint=str(generation / ('epoch_{}.pth'.format(best['epoch']))) if best else None,
+        original_best_epoch_checkpoint=str(original_generation / (
+            'epoch_{}.pth'.format(best['epoch']))) if best else None,
         minimum_foreground_deltaE=finite(minimum_fg.get('deltaE_P3_foreground')) if minimum_fg else None,
         minimum_foreground_deltaE_epoch=minimum_fg['epoch'] if minimum_fg else None,
         last_val_PSNR=finite(last.get('PSNR')),
@@ -172,7 +213,16 @@ def summarize_run(run, manifest, suite):
         peak_reserved_bytes=resources.get('peak_reserved_bytes') if resources else None,
         gpu=resources.get('gpu') if resources else None,
         code_revision=resources.get('code_revision') if resources else manifest.get('code_revision'),
-        source_logs=log_paths, overwritten_mode_epoch_records=overwritten, warnings=warnings)
+        source_logs=log_paths,
+        original_source_logs=[str(original_generation / Path(path).name) for path in log_paths],
+        source_provenance=dict(
+            original_work_dir=run['work_dir'], original_config=run.get('config'),
+            source_config=manifest.get('source_config'),
+            source_config_sha256=manifest.get('source_config_sha256'),
+            source_checkpoint=manifest.get('source_checkpoint'),
+            teacher_checkpoint=manifest.get('teacher_checkpoint'),
+            parent_revision=manifest.get('parent_revision'), code_revision=manifest.get('code_revision')),
+        overwritten_mode_epoch_records=overwritten, warnings=warnings)
     return item, records
 
 
@@ -187,7 +237,8 @@ def atomic_json(path, value):
 
 def csv_rows(path, items):
     names = [name for name in items[0] if name not in
-             ('runtime_resources', 'source_logs', 'warnings', 'train_loss_sources')] if items else [
+             ('runtime_resources', 'source_logs', 'original_source_logs', 'source_provenance',
+              'warnings', 'train_loss_sources')] if items else [
                  'scene', 'variant', 'name', 'status']
     with tempfile.NamedTemporaryFile(mode='w', dir=str(path.parent), suffix='.tmp',
                                      newline='', delete=False) as handle:
@@ -312,9 +363,15 @@ def main():
     parser.add_argument('--output', type=Path, help='default: SUITE/training_curves')
     parser.add_argument('--historical', action='store_true',
                         help='show clearly labelled old PSNR reference, not a matched control')
+    parser.add_argument('--path-map', action='append', default=[], metavar='OLD=NEW',
+                        help='map manifest work_dir prefixes to local mirrors; repeatable, longest prefix wins')
     parser.add_argument('--no-plots', action='store_true',
-                        help='refresh JSON/CSV only; useful before installing NumPy/Matplotlib')
+                        help='refresh JSON/CSV only without importing any plotting libraries')
     args = parser.parse_args()
+    try:
+        path_maps = parse_path_maps(args.path_map)
+    except ValueError as error:
+        parser.error(str(error))
     suite = args.suite.expanduser().resolve()
     output = args.output.expanduser().resolve() if args.output else suite / 'training_curves'
     paths = sorted(suite.glob('manifest_*.json'))
@@ -329,14 +386,19 @@ def main():
             continue
         provenance.append(dict(path=str(path.resolve()), scene=manifest['scene'],
                                initialization=manifest.get('initialization'),
-                               code_revision=manifest.get('code_revision')))
+                               code_revision=manifest.get('code_revision'),
+                               parent_revision=manifest.get('parent_revision'),
+                               source_config=manifest.get('source_config'),
+                               source_config_sha256=manifest.get('source_config_sha256'),
+                               source_checkpoint=manifest.get('source_checkpoint'),
+                               teacher_checkpoint=manifest.get('teacher_checkpoint')))
         for run in manifest.get('runs', []):
             if not isinstance(run, dict) or not run.get('work_dir') or not run.get('name'):
                 warnings.append({'path': str(path), 'reason': 'Skipped malformed run entry'})
                 continue
             if run['name'] in series:
                 raise ValueError('duplicate experiment name across manifests: ' + run['name'])
-            item, records = summarize_run(run, manifest, suite)
+            item, records = summarize_run(run, manifest, suite, path_maps)
             item['manifest'] = str(path.resolve())
             items.append(item)
             series[item['name']] = records
@@ -348,7 +410,7 @@ def main():
                 artifacts.extend(plot_scene(scene, scene_items, series, output, args.historical))
     summary = dict(
         generated_utc=datetime.now(timezone.utc).isoformat(), suite=str(suite),
-        manifests=provenance, experiments=items,
+        manifests=provenance, path_maps=path_maps, experiments=items,
         experiments_count=len(items), completed_count=sum(item['training_completed'] for item in items),
         all_training_completed=bool(items) and all(item['training_completed'] for item in items),
         historical_PSNR_reference=HISTORICAL_PSNR if args.historical else None,

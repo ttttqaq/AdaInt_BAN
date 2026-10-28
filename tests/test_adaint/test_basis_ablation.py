@@ -1,6 +1,8 @@
 """Isolate basis-LUT generation while keeping the semantic enhancer unchanged."""
+import ast
 import copy
 import subprocess
+import textwrap
 
 import pytest
 import torch
@@ -114,15 +116,31 @@ def test_ablation_config_only_changes_lut_mode_and_output_names(scene):
 
 
 def test_postprocess_preserves_global_mapping_and_legacy_decoder():
-    # Postprocessing is now intentionally extended; global LUT construction and
-    # the original decoder remain protected. Numerical replay is tested separately.
+    # Protect the old global mapping when the opt-in bounded mode is disabled.
+    # The enabled branch intentionally changes actual LUT construction and has
+    # its own numerical/gradient/range tests; old checkpoint replay is separate.
     old_model = subprocess.check_output(['git', 'show', 'fcaf8bc:adaint/model_semantic.py']).decode()
     with open('adaint/model_semantic.py') as handle:
         new_model = handle.read()
     start = '    def forward_dummy('
     old_global = old_model[old_model.index(start):].split('        context_deltas,')[0]
     new_global = new_model[new_model.index(start):].split('        context_globals =')[0]
-    assert old_global == new_global
+    enabled = ast.dump(ast.parse("self.bounded_curve_cfg['enabled']", mode='eval').body)
+
+    class BoundedOff(ast.NodeTransformer):
+        removed = 0
+
+        def visit_If(self, node):
+            if ast.dump(node.test) == enabled:
+                assert not node.orelse
+                self.removed += 1
+                return None
+            return self.generic_visit(node)
+
+    disabled = BoundedOff()
+    current = disabled.visit(ast.parse(textwrap.dedent(new_global)))
+    assert disabled.removed == 1
+    assert ast.dump(ast.parse(textwrap.dedent(old_global))) == ast.dump(current)
     old_modules = subprocess.check_output(['git', 'show', 'fcaf8bc:adaint/semantic_modules.py']).decode()
     with open('adaint/semantic_modules.py') as handle:
         new_modules = handle.read()

@@ -15,6 +15,7 @@ from .semantic_modules import (checked_mask, masked_per_image, RegionColorStatis
                                RegionMapping, DualLocalAffineDecoder)
 from .postprocess import (postprocess_options, ResultAwareLocalDecoder,
                           ResidualCalibration)
+from .range_project import (range_options, project_rgb, range_error, difficult_losses)
 
 
 def region_samples(image, mask, size):
@@ -34,7 +35,7 @@ class AiLUTDual(AiLUT):
                  foreground_rgb_weight=.1, background_rgb_weight=.1,
                  foreground_color_weight=.1, background_color_weight=.1,
                  face_color_weight=0., boundary_gradient_weight=0.,
-                 lut_mode='tone_residual', postprocess=None, **kwargs):
+                 lut_mode='tone_residual', postprocess=None, range_project=None, **kwargs):
         if lut_mode not in ('tone_residual', 'basis'):
             raise ValueError("lut_mode must be 'tone_residual' or 'basis'")
         self.lut_mode = lut_mode
@@ -42,6 +43,7 @@ class AiLUTDual(AiLUT):
             raise ValueError('AiLUTDual currently trains without BAN; use gen=1, enable_kd=false in config')
         super().__init__(**kwargs)
         self.postprocess_cfg = postprocess_options(postprocess)
+        self.range_project_cfg = range_options(range_project)
         self.global_frozen = self.postprocess_cfg['freeze_global']
         self.local_enabled, self.use_region_condition = bool(local_enabled), bool(use_region_condition)
         if region_samples_size < 1 or not 0 <= region_sample_mix <= 1 or not 0 < region_min_area < .5:
@@ -208,10 +210,14 @@ class AiLUTDual(AiLUT):
             d0 = d0 + self.postprocess_fixed_bias.to(output)
         calibration_delta = d0 + (foreground_mask - pi) * d1
         output = output + calibration_delta
+        raw_output = output
+        if self.range_project_cfg['enabled']:
+            output = project_rgb(raw_output)
         weights, vertices = torch.stack(weights_list, 1), torch.stack(vertices_list, 1)
         if return_aux:
             return output, weights, vertices, dict(
                 luts=luts, vertices=vertices_list, branch_outputs=outputs,
+                raw_output=raw_output,
                 global_outputs=global_outputs, local_deltas=deltas,
                 context_deltas=context_deltas, delta_means=means,
                 low_coefficients=lows, local_reference=low_source,
@@ -230,7 +236,28 @@ class AiLUTDual(AiLUT):
         output, weights, vertices, aux = self.forward_dummy(lq, True, lq_context, context_samples,
             crop_box, foreground_mask, **{key: kwargs[key] for key in required})
         supervision_mask = checked_mask(supervision_mask, lq, 'supervision_mask')
-        losses = dict(loss_recons=self.recons_loss(output, gt))
+        projection = self.range_project_cfg
+        reconstruction = aux['raw_output'] if projection['enabled'] else output
+        losses = dict(loss_recons=self.recons_loss(reconstruction, gt))
+        if projection['enabled']:
+            raw = aux['raw_output']
+            if projection['range_weight']:
+                losses['loss_range'] = projection['range_weight'] * range_error(raw).mean()
+            if projection['hard_weight'] or projection['gradient_weight']:
+                hard, gradient = difficult_losses(raw, output, gt,
+                    (supervision_mask, 1 - supervision_mask),
+                    projection['hard_fraction'], self.region_min_area)
+                if projection['hard_weight']:
+                    losses['loss_range_hard_rgb'] = projection['hard_weight'] * hard
+                if projection['gradient_weight']:
+                    losses['loss_range_gradient'] = projection['gradient_weight'] * gradient
+            proposed, final = raw.detach(), output.detach()
+            legal = (proposed >= 0) & (proposed <= 1)
+            losses.update(
+                range_raw_clip_fraction=((proposed < 0) | (proposed > 1)).any(1).float().mean(),
+                range_final_clip_fraction=((final < 0) | (final > 1)).any(1).float().mean(),
+                range_projection_abs_mean=(final - proposed).abs().mean(),
+                range_legal_max_change=((final - proposed).abs() * legal).amax())
         if self.color_loss_weight:
             color, statistics = self.color_loss(output, gt)
             losses['loss_color'] = self.color_loss_weight * color

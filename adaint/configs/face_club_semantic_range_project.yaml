@@ -1,6 +1,6 @@
 # Scratch/full-parameter range projection; original affine/LUT/DC retained.
 # Train+validation native export is performed once by infer_after_generation.
-exp_name: rp_20261029_club_s2026
+exp_name: rp_20261029_club_s2026_1
 custom_imports:
   imports:
   - adaint
@@ -249,7 +249,7 @@ dist_params:
   backend: nccl
 log_level: INFO
 postprocess_init: null
-work_dir: ./work_dirs/rp_20261029_club_s2026
+work_dir: ./work_dirs/rp_20261029_club_s2026_1
 load_from: null
 resume_from: null
 find_unused_parameters: true

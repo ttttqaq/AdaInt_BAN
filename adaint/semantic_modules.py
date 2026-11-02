@@ -87,24 +87,29 @@ class RegionMapping(nn.Module):
     def __init__(self, cnn_features, stats_features, condition_dim, hidden_dim,
                  n_vertices, n_ranks, curve_points, min_interval, lut_mode='tone_residual'):
         super().__init__()
-        if lut_mode not in ('tone_residual', 'basis'):
-            raise ValueError("lut_mode must be 'tone_residual' or 'basis'")
+        if lut_mode not in ('tone_residual', 'basis', 'bounded'):
+            raise ValueError('unsupported regional LUT mode')
         self.lut_mode = lut_mode
         self.condition_encoder = ConditionEncoder(cnn_features, stats_features * 2 + 2, condition_dim)
         # Preserve allocation order to keep all common seeded initializations.
         self.tone_curve = ToneCurve(curve_points, condition_dim, hidden_dim)
         self.adaint = AdaptiveIntervals(n_vertices, condition_dim, hidden_dim, min_interval)
-        generator = NormalizedResidualLUT if lut_mode == 'tone_residual' else BasisLUT
+        if lut_mode == 'bounded':
+            from .controlled_tone import BoundedExpertLUT
+            generator = BoundedExpertLUT
+        else:
+            generator = NormalizedResidualLUT if lut_mode == 'tone_residual' else BasisLUT
         self.lut_generator = generator(n_vertices, n_ranks, condition_dim, hidden_dim)
-        if lut_mode == 'basis':
+        if lut_mode in ('basis', 'bounded'):
             del self.tone_curve
 
     def forward(self, cnn_code, global_stats, region_stats, area, reliability):
         condition = self.condition_encoder(cnn_code, torch.cat(
             (global_stats, region_stats, area, reliability), 1))
-        if self.lut_mode == 'basis':
+        if self.lut_mode in ('basis', 'bounded'):
             vertices = self.adaint(condition)
-            weights, lut = self.lut_generator(condition)
+            weights, lut = (self.lut_generator(condition, vertices)
+                            if self.lut_mode == 'bounded' else self.lut_generator(condition))
             return condition, weights, vertices, lut
         curves = self.tone_curve.predict_curves(condition)
         vertices = self.adaint(condition)

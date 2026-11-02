@@ -15,6 +15,9 @@ from .semantic_modules import (checked_mask, masked_per_image, RegionColorStatis
                                RegionMapping, DualLocalAffineDecoder)
 from .postprocess import (postprocess_options, ResultAwareLocalDecoder,
                           ResidualCalibration)
+from .safe_affine import safe_options, protect_rgb, highlight_losses, regional_mean
+from .controlled_tone import (SharedRegionMapping, ExposureLocalDecoder,
+                              exposure_correction)
 
 
 def region_samples(image, mask, size):
@@ -34,14 +37,26 @@ class AiLUTDual(AiLUT):
                  foreground_rgb_weight=.1, background_rgb_weight=.1,
                  foreground_color_weight=.1, background_color_weight=.1,
                  face_color_weight=0., boundary_gradient_weight=0.,
-                 lut_mode='tone_residual', postprocess=None, **kwargs):
-        if lut_mode not in ('tone_residual', 'basis'):
-            raise ValueError("lut_mode must be 'tone_residual' or 'basis'")
+                 lut_mode='tone_residual', postprocess=None, safe_affine=None,
+                 global_mode='independent', global_aux_weight=0.,
+                 foreground_residual_rank=3, foreground_residual_limit=.08,
+                 local_mode='rgb', exposure_limit=.15, **kwargs):
+        if lut_mode not in ('tone_residual', 'basis', 'bounded'):
+            raise ValueError('unsupported LUT mode')
+        if global_mode not in ('independent', 'shared') or local_mode not in ('rgb', 'exposure'):
+            raise ValueError('unsupported global/local mode')
+        if not math.isfinite(global_aux_weight) or global_aux_weight < 0:
+            raise ValueError('global_aux_weight must be finite and nonnegative')
+        if not math.isfinite(exposure_limit) or not 0 < exposure_limit <= .5:
+            raise ValueError('exposure_limit must be in (0,.5]')
+        self.global_mode, self.local_mode = global_mode, local_mode
+        self.global_aux_weight, self.exposure_limit = float(global_aux_weight), float(exposure_limit)
         self.lut_mode = lut_mode
         if kwargs.get('gen', 0) > 0 or kwargs.get('kd_loss') is not None:
             raise ValueError('AiLUTDual currently trains without BAN; use gen=1, enable_kd=false in config')
         super().__init__(**kwargs)
         self.postprocess_cfg = postprocess_options(postprocess)
+        self.safe_affine_cfg = safe_options(safe_affine)
         self.global_frozen = self.postprocess_cfg['freeze_global']
         self.local_enabled, self.use_region_condition = bool(local_enabled), bool(use_region_condition)
         if region_samples_size < 1 or not 0 <= region_sample_mix <= 1 or not 0 < region_min_area < .5:
@@ -65,13 +80,23 @@ class AiLUTDual(AiLUT):
         options = (self.backbone.out_channels, self.color_statistics.output_features, dimension,
                    hidden, self.n_vertices, kwargs.get('n_ranks', 5),
                    kwargs.get('curve_points', 16), kwargs.get('min_interval', .001), lut_mode)
-        self.branches = nn.ModuleDict({name: RegionMapping(*options)
-                                       for name in ('foreground', 'background')})
+        if global_mode == 'shared':
+            self.branches = nn.ModuleDict({'shared': SharedRegionMapping(*options,
+                residual_rank=foreground_residual_rank,
+                residual_limit=foreground_residual_limit)})
+        else:
+            self.branches = nn.ModuleDict({name: RegionMapping(*options)
+                                           for name in ('foreground', 'background')})
         if self.local_enabled:
             arguments = (dimension, kwargs.get('local_resolution', 128),
                          kwargs.get('local_channels', 16), kwargs.get('guided_filter_radius', 2),
                          kwargs.get('guided_filter_epsilon', .001))
-            if (self.postprocess_cfg['result_condition'] or self.postprocess_cfg['multiscale'] or
+            if local_mode == 'exposure':
+                if (self.postprocess_cfg['result_condition'] or self.postprocess_cfg['multiscale'] or
+                    self.postprocess_cfg['guidance'] != 'luminance'):
+                    raise ValueError('exposure local uses single-scale luminance guidance')
+                self.local_decoder = ExposureLocalDecoder(*arguments)
+            elif (self.postprocess_cfg['result_condition'] or self.postprocess_cfg['multiscale'] or
                     self.postprocess_cfg['guidance'] != 'luminance'):
                 self.local_decoder = ResultAwareLocalDecoder(*arguments,
                     result_condition=self.postprocess_cfg['result_condition'],
@@ -129,6 +154,7 @@ class AiLUTDual(AiLUT):
         supplied_samples = (foreground_region_samples, background_region_samples)
         names = ('foreground', 'background')
         conditions, weights_list, vertices_list, luts, global_outputs, stats_list = [], [], [], [], [], []
+        region_list, reliability_list = [], []
         for index, name in enumerate(names):
             mask = sample_mask if index == 0 else 1 - sample_mask
             region = area if index == 0 else 1 - area
@@ -147,12 +173,21 @@ class AiLUTDual(AiLUT):
             stats = reliability * stats + (1 - reliability) * global_stats
             if not self.use_region_condition:
                 stats, region, reliability = global_stats, torch.zeros_like(region), torch.ones_like(region)
-            condition, weights, vertices, lut = self.branches[name](cnn_code, global_stats, stats, region, reliability)
-            conditions.append(condition)
-            weights_list.append(weights)
-            vertices_list.append(vertices)
-            luts.append(lut)
             stats_list.append(stats)
+            region_list.append(region)
+            reliability_list.append(reliability)
+        if self.global_mode == 'shared':
+            conditions, weights_list, vertices_list, luts = self.branches['shared'](
+                cnn_code, global_stats, stats_list[0], region_list[0], reliability_list[0])
+        else:
+            for index, name in enumerate(names):
+                condition, weights, vertices, lut = self.branches[name](cnn_code,
+                    global_stats, stats_list[index], region_list[index], reliability_list[index])
+                conditions.append(condition)
+                weights_list.append(weights)
+                vertices_list.append(vertices)
+                luts.append(lut)
+        for lut, vertices in zip(luts, vertices_list):
             global_outputs.append(ailut_transform(imgs, lut, vertices))
         context_globals = None
         if self.postprocess_cfg['result_condition'] or hasattr(self, 'postprocess_calibration'):
@@ -171,17 +206,25 @@ class AiLUTDual(AiLUT):
                 low = fields[0][0]
                 coefficients = sum(self.local_decoder.upsample(slope, offset, imgs, crop_box)
                                    for _, slope, offset in fields)
-                raw_delta = coefficients[:, :1] * global_outputs[index] + coefficients[:, 1:]
                 context_coefficients = sum(self.local_decoder.upsample(slope, offset, low_source)
                                            for _, slope, offset in fields)
                 context_global = ailut_transform(low_source, luts[index], vertices_list[index])
-                context_raw = context_coefficients[:, :1] * context_global + context_coefficients[:, 1:]
                 mask = low_mask if index == 0 else 1 - low_mask
                 mass = mask.sum((-1, -2), keepdim=True)
                 active = ((area if index == 0 else 1 - area) >= self.region_min_area).to(imgs)[:, :, None, None]
-                mean = (context_raw * mask).sum((-1, -2), keepdim=True) / mass.clamp_min(1e-8)
-                delta = (raw_delta - mean) * active
-                context_deltas.append((context_raw - mean) * active)
+                if self.local_mode == 'exposure':
+                    mean = (context_coefficients.tanh() * mask).sum((-1, -2), keepdim=True) / mass.clamp_min(1e-8)
+                    delta = exposure_correction(global_outputs[index], coefficients,
+                                                mean, active, self.exposure_limit)
+                    context_delta = exposure_correction(context_global,
+                        context_coefficients, mean, active, self.exposure_limit)
+                else:
+                    raw_delta = coefficients[:, :1] * global_outputs[index] + coefficients[:, 1:]
+                    context_raw = context_coefficients[:, :1] * context_global + context_coefficients[:, 1:]
+                    mean = (context_raw * mask).sum((-1, -2), keepdim=True) / mass.clamp_min(1e-8)
+                    delta = (raw_delta - mean) * active
+                    context_delta = (context_raw - mean) * active
+                context_deltas.append(context_delta)
                 deltas.append(delta)
                 means.append(mean * active)
                 lows.append(low)
@@ -208,10 +251,15 @@ class AiLUTDual(AiLUT):
             d0 = d0 + self.postprocess_fixed_bias.to(output)
         calibration_delta = d0 + (foreground_mask - pi) * d1
         output = output + calibration_delta
+        raw_output = output
+        protection = None
+        if self.safe_affine_cfg['enabled']:
+            output, protection = protect_rgb(raw_output, imgs, self.safe_affine_cfg['knee'])
         weights, vertices = torch.stack(weights_list, 1), torch.stack(vertices_list, 1)
         if return_aux:
             return output, weights, vertices, dict(
                 luts=luts, vertices=vertices_list, branch_outputs=outputs,
+                raw_output=raw_output, protection=protection,
                 global_outputs=global_outputs, local_deltas=deltas,
                 context_deltas=context_deltas, delta_means=means,
                 low_coefficients=lows, local_reference=low_source,
@@ -231,6 +279,39 @@ class AiLUTDual(AiLUT):
             crop_box, foreground_mask, **{key: kwargs[key] for key in required})
         supervision_mask = checked_mask(supervision_mask, lq, 'supervision_mask')
         losses = dict(loss_recons=self.recons_loss(output, gt))
+        if self.global_aux_weight:
+            auxiliary = output.new_zeros(())
+            for global_output, mask in zip(aux['global_outputs'],
+                                           (supervision_mask, 1 - supervision_mask)):
+                error = (global_output - gt).square().mean(1, keepdim=True)
+                auxiliary = auxiliary + masked_per_image(error, mask, self.region_min_area)[0]
+                if self.color_loss_weight:
+                    color = p3_delta_e_map(global_output, gt, epsilon=1e-3)
+                    auxiliary = auxiliary + self.color_loss_weight * masked_per_image(
+                        color, mask, self.region_min_area)[0] / 100.
+            losses['loss_global_aux'] = self.global_aux_weight * auxiliary / 2
+        safety = self.safe_affine_cfg
+        if safety['enabled']:
+            masks = (supervision_mask, 1 - supervision_mask)
+            risk = aux['protection']['risk'].detach().to(output)
+            if safety['raw_weight']:
+                raw_error = (aux['raw_output'] - gt).square().mean(1, keepdim=True)
+                losses['loss_safe_raw'] = safety['raw_weight'] * sum(
+                    regional_mean(raw_error, risk * mask) for mask in masks) / 2
+            bright, gradient = highlight_losses(output, gt, masks,
+                safety['top_fraction'], self.region_min_area)
+            if safety['highlight_weight']:
+                losses['loss_safe_highlight'] = safety['highlight_weight'] * bright
+            if safety['gradient_weight']:
+                losses['loss_safe_gradient'] = safety['gradient_weight'] * gradient
+            raw = aux['raw_output'].detach()
+            protected = ~aux['protection']['risk']
+            losses.update(safe_risk_fraction=risk.mean(),
+                safe_projection_fraction=aux['protection']['projected'].float().mean(),
+                safe_raw_clip_fraction=((raw < 0) | (raw > 1)).any(1).float().mean(),
+                safe_final_clip_fraction=((output.detach() < 0) | (output.detach() > 1)).any(1).float().mean(),
+                safe_change_abs_mean=(output.detach() - raw).abs().mean(),
+                safe_protected_max_change=((output.detach() - raw).abs() * protected).amax())
         if self.color_loss_weight:
             color, statistics = self.color_loss(output, gt)
             losses['loss_color'] = self.color_loss_weight * color

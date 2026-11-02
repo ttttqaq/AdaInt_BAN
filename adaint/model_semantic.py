@@ -42,7 +42,7 @@ class AiLUTDual(AiLUT):
                  foreground_residual_rank=3, foreground_residual_limit=.08,
                  local_mode='rgb', exposure_limit=.15, **kwargs):
         if lut_mode not in ('tone_residual', 'basis', 'bounded'):
-            raise ValueError('unsupported LUT mode')
+            raise ValueError('unsupported lut_mode')
         if global_mode not in ('independent', 'shared') or local_mode not in ('rgb', 'exposure'):
             raise ValueError('unsupported global/local mode')
         if not math.isfinite(global_aux_weight) or global_aux_weight < 0:

@@ -88,7 +88,7 @@ class RegionMapping(nn.Module):
                  n_vertices, n_ranks, curve_points, min_interval, lut_mode='tone_residual'):
         super().__init__()
         if lut_mode not in ('tone_residual', 'basis', 'bounded'):
-            raise ValueError('unsupported regional LUT mode')
+            raise ValueError('unsupported regional lut_mode')
         self.lut_mode = lut_mode
         self.condition_encoder = ConditionEncoder(cnn_features, stats_features * 2 + 2, condition_dim)
         # Preserve allocation order to keep all common seeded initializations.

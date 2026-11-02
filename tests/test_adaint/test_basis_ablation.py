@@ -114,18 +114,14 @@ def test_ablation_config_only_changes_lut_mode_and_output_names(scene):
 
 
 def test_postprocess_preserves_global_mapping_and_legacy_decoder():
-    # Postprocessing is now intentionally extended; global LUT construction and
-    # the original decoder remain protected. Numerical replay is tested separately.
-    old_model = subprocess.check_output(['git', 'show', 'fcaf8bc:adaint/model_semantic.py']).decode()
-    with open('adaint/model_semantic.py') as handle:
-        new_model = handle.read()
-    start = '    def forward_dummy('
-    old_global = old_model[old_model.index(start):].split('        context_deltas,')[0]
-    new_global = new_model[new_model.index(start):].split('        context_globals =')[0]
-    assert old_global == new_global
+    # New opt-in global parameterizations intentionally change the dispatcher.
+    # Protect the actual legacy bank/decoder here; all-off numerical forward
+    # and loss equality is checked against 1d3898a in test_postprocess.py.
     old_modules = subprocess.check_output(['git', 'show', 'fcaf8bc:adaint/semantic_modules.py']).decode()
     with open('adaint/semantic_modules.py') as handle:
         new_modules = handle.read()
+    start = 'class BasisLUT'
+    assert old_modules.split(start)[1].split('class RegionMapping')[0] == new_modules.split(start)[1].split('class RegionMapping')[0]
     start = 'class DualLocalAffineDecoder'
     assert old_modules[old_modules.index(start):] == new_modules[new_modules.index(start):]
 

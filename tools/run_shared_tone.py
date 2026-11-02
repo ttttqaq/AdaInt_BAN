@@ -193,8 +193,8 @@ def run(scene, index, gpu, smoke=False):
 def launch(gpus):
     if socket.gethostname().split('.')[0].upper() != 'DB28':
         raise RuntimeError('Launch on DB28 only')
-    if len(gpus) < 4 or len(set(gpus)) != len(gpus):
-        raise ValueError('12 jobs require four distinct empty GPUs, three jobs per GPU')
+    if len(gpus) != 4 or len(set(gpus)) != len(gpus):
+        raise ValueError('Use four distinct GPUs, at most two suite jobs per GPU')
     import fcntl
     SUITE.mkdir(parents=True, exist_ok=True)
     with (SUITE / 'launch.lock').open('w') as lock:
@@ -202,14 +202,14 @@ def launch(gpus):
         manifest_path = SUITE / 'manifest.json'
         if manifest_path.exists():
             raise RuntimeError('Suite already launched; inspect its manifest/status first')
-        inventory = subprocess.check_output(['nvidia-smi', '--query-gpu=index,uuid,memory.used',
+        inventory = subprocess.check_output(['nvidia-smi', '--query-gpu=index,uuid,memory.total,memory.used',
                                             '--format=csv,noheader,nounits']).decode().splitlines()
         cards = {int(line.split(',')[0]): line.split(',') for line in inventory}
-        running = subprocess.check_output(['nvidia-smi', '--query-compute-apps=gpu_uuid',
-                                          '--format=csv,noheader']).decode()
         for gpu in gpus:
-            if int(cards[gpu][2]) > 5 or cards[gpu][1].strip() in running:
-                raise RuntimeError('GPU no longer completely empty: ' + str(gpu))
+            # The user explicitly authorized sharing DB28 GPUs 4--7, with two
+            # of this suite's experiments on each. Do not touch existing jobs.
+            if int(cards[gpu][2]) - int(cards[gpu][3]) < 8192:
+                raise RuntimeError('Less than 8 GiB free for two suite jobs: ' + str(gpu))
         jobs = []
         for index in range(1, 7):
             for scene in ['indoor', 'outdoor']:
@@ -218,30 +218,62 @@ def launch(gpus):
                 if destination.exists():
                     raise RuntimeError('Existing experiment directory: ' + str(destination))
                 jobs.append(dict(scene=scene, index=index, exp_name=name,
-                                 gpu=gpus[len(jobs) // 3], work_dir=str(destination)))
+                                 gpu=gpus[(len(jobs) // 2) % len(gpus)], work_dir=str(destination)))
         manifest = dict(code_revision=revision(), host=socket.gethostname(),
-            started=time.time(), epochs=100, seed=2026, jobs_per_gpu=3, jobs=jobs,
+            started=time.time(), epochs=100, seed=2026, jobs_per_gpu=2, jobs=jobs,
+            shared_gpu_authorization=True, launch_gpu_inventory=inventory,
             checkpoint_interval_epochs=5, evaluation_interval_epochs=5,
             regression_ids=['1', '16', '17'], labels=LABELS)
         save(manifest_path, manifest)
         for job in jobs:
             destination = Path(job['work_dir']); destination.mkdir(parents=True)
-            log = (destination / 'console.log').open('w')
-            env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(job['gpu']),
+            save(destination / 'status.json', dict(status='waiting_for_own_slot',
+                gpu=job['gpu'], scene=job['scene'], index=job['index'],
+                code_revision=manifest['code_revision']))
+        manifest['workers'] = []
+        for gpu in gpus:
+            log = (SUITE / ('gpu_' + str(gpu) + '.log')).open('w')
+            env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu),
                        OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1',
                        PYTHONDONTWRITEBYTECODE='1', PYTHONPATH=str(ROOT))
-            command = [PYTHON, str(Path(__file__).resolve()), 'run', '--scene', job['scene'],
-                       '--index', str(job['index']), '--gpu', str(job['gpu'])]
+            command = [PYTHON, str(Path(__file__).resolve()), 'worker', '--gpu', str(gpu)]
             process = subprocess.Popen(command, cwd=str(ROOT), env=env,
                                        stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-            log.close(); job['pid'] = process.pid
+            log.close(); manifest['workers'].append(dict(gpu=gpu, pid=process.pid))
             save(manifest_path, manifest)
         print(json.dumps(manifest, indent=2))
 
 
+def worker(gpu):
+    from concurrent.futures import ThreadPoolExecutor
+    manifest = json.loads((SUITE / 'manifest.json').read_text())
+    jobs = [job for job in manifest['jobs'] if job['gpu'] == gpu]
+
+    def execute(job):
+        if revision() != manifest['code_revision']:
+            raise RuntimeError('Source revision changed after launch')
+        destination = Path(job['work_dir'])
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), OMP_NUM_THREADS='1',
+                   OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1',
+                   PYTHONDONTWRITEBYTECODE='1', PYTHONPATH=str(ROOT))
+        command = [PYTHON, str(Path(__file__).resolve()), 'run', '--scene', job['scene'],
+                   '--index', str(job['index']), '--gpu', str(gpu)]
+        with (destination / 'console.log').open('w') as log:
+            process = subprocess.Popen(command, cwd=str(ROOT), env=env,
+                stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            result = process.wait()
+        print(job['exp_name'], 'exit', result, flush=True)
+        return result
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(execute, jobs))
+    save(SUITE / ('gpu_' + str(gpu) + '_status.json'),
+         dict(gpu=gpu, completed=time.time(), exit_codes=results))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['run', 'smoke', 'launch', 'status'])
+    parser.add_argument('action', choices=['run', 'smoke', 'launch', 'worker', 'status'])
     parser.add_argument('--scene', choices=['indoor', 'outdoor'], default='outdoor')
     parser.add_argument('--index', type=int, choices=range(1, 7), default=6)
     parser.add_argument('--gpu', type=int, default=4)
@@ -251,12 +283,14 @@ def main():
         run(args.scene, args.index, args.gpu, smoke=args.action == 'smoke')
     elif args.action == 'launch':
         launch([int(x) for x in args.gpus.split(',')])
+    elif args.action == 'worker':
+        worker(args.gpu)
     else:
         manifest = json.loads((SUITE / 'manifest.json').read_text())
         for job in manifest['jobs']:
             path = Path(job['work_dir']) / 'status.json'
             state = json.loads(path.read_text()) if path.exists() else {'status': 'starting'}
-            print(job['exp_name'], job['gpu'], job.get('pid'), state['status'])
+            print(job['exp_name'], job['gpu'], state.get('pid'), state['status'])
 
 
 if __name__ == '__main__':

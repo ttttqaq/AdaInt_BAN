@@ -117,7 +117,7 @@ def test_postprocess_preserves_global_mapping_and_legacy_decoder():
     # New opt-in global parameterizations intentionally change the dispatcher.
     # Protect the actual legacy bank/decoder here; all-off numerical forward
     # and loss equality is checked against 1d3898a in test_postprocess.py.
-    old_modules = subprocess.check_output(['git', 'show', 'fcaf8bc:adaint/semantic_modules.py']).decode()
+    old_modules = subprocess.check_output(['git', 'show', '1d3898a:adaint/semantic_modules.py']).decode()
     with open('adaint/semantic_modules.py') as handle:
         new_modules = handle.read()
     start = 'class BasisLUT'

@@ -1,6 +1,6 @@
 # Scratch/full-parameter range projection; original affine/LUT/DC retained.
 # Train+validation native export is performed once by infer_after_generation.
-exp_name: rp_20261029_club_s2026_1
+exp_name: rp_20261103_club_clean_s2026
 custom_imports:
   imports:
   - adaint
@@ -99,9 +99,9 @@ data:
     persistent_workers: true
   train:
     type: Face
-    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/club/train
-    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/club/train
-    ann_file: adaint/annfiles/Face/club_train.txt
+    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/club_clean/train
+    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/club_clean/train
+    ann_file: adaint/annfiles/Face/club_clean_train.txt
     pipeline:
     - type: LoadImageFromFile
       io_backend: disk
@@ -157,9 +157,9 @@ data:
     filetmpl_gt: '{}_gt.jpg'
   val:
     type: Face
-    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/club/train
-    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/club/train
-    ann_file: adaint/annfiles/Face/club_val.txt
+    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/club_clean/train
+    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/club_clean/train
+    ann_file: adaint/annfiles/Face/club_clean_val.txt
     pipeline:
     - type: LoadImageFromFile
       io_backend: disk
@@ -197,9 +197,9 @@ data:
     filetmpl_gt: '{}_gt.jpg'
   test:
     type: Face
-    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/club/test
-    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/club/test
-    ann_file: adaint/annfiles/Face/club_test.txt
+    dir_lq: /DB/data/yujietang/IQ-LUT/face_dataset/club_clean/test
+    dir_gt: /DB/data/yujietang/IQ-LUT/face_dataset/club_clean/test
+    ann_file: adaint/annfiles/Face/club_clean_test.txt
     pipeline:
     - type: LoadImageFromFile
       io_backend: disk
@@ -249,7 +249,7 @@ dist_params:
   backend: nccl
 log_level: INFO
 postprocess_init: null
-work_dir: ./work_dirs/rp_20261029_club_s2026_1
+work_dir: ./work_dirs/rp_20261103_club_clean_s2026
 load_from: null
 resume_from: null
 find_unused_parameters: true
@@ -257,9 +257,9 @@ log_interval_epochs: 1
 dataset: face
 semantic_masks:
   region_label: person
-  train_foreground_root: /DB/data/yujietang/IQ-LUT/face_dataset/club_person_mask/train
-  val_foreground_root: /DB/data/yujietang/IQ-LUT/face_dataset/club_person_mask/train
-  test_foreground_root: /DB/data/yujietang/IQ-LUT/face_dataset/club_person_mask/value
+  train_foreground_root: /DB/data/yujietang/IQ-LUT/face_dataset/club_clean/person_masks/train
+  val_foreground_root: /DB/data/yujietang/IQ-LUT/face_dataset/club_clean/person_masks/train
+  test_foreground_root: /DB/data/yujietang/IQ-LUT/face_dataset/club_clean/person_masks/test
   train_face_root: null
   val_face_root: null
   test_face_root: null
@@ -271,11 +271,42 @@ semantic_masks:
 best_checkpoint_metric: PSNR
 best_checkpoint_rule: greater
 dataset_split:
-  description: Numeric ID order within club/train; last ceil(10%) held out. Independent
-    club/test has no GT.
-  source_train_count: 158
-  train_count: 142
-  val_count: 16
+  description: Fixed random 10% holdout sampled once with Python random.Random(2026)
+    from numerically sorted retained pair IDs; stored annfiles define all future runs.
+    Independent test has no GT.
+  original_source_train_count: 158
+  removed_pair_count: 9
+  removed_pair_ids:
+  - 119
+  - 120
+  - 127
+  - 134
+  - 136
+  - 174
+  - 175
+  - 176
+  - 186
+  source_train_count: 149
+  train_count: 134
+  val_count: 15
   test_count: 30
   val_ratio: 0.1
+  split_seed: 2026
+  split_method: random.sample once; ceil(N*0.1); fixed text lists
+  fixed_val_ids:
+  - 1
+  - 35
+  - 42
+  - 46
+  - 76
+  - 81
+  - 101
+  - 140
+  - 145
+  - 158
+  - 164
+  - 167
+  - 179
+  - 181
+  - 185
   test_uses_validation: false

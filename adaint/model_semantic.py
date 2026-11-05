@@ -28,6 +28,35 @@ def region_samples(image, mask, size):
     return image.flatten(2).gather(2, indices[:, None].expand(-1, 3, -1)).view(-1, 3, size, size)
 
 
+def regional_low_frequency_loss(prediction, target, mask, grid_size, min_area):
+    """Match raw global RGB means in non-overlapping, region-weighted cells."""
+    height, width = prediction.shape[-2:]
+    rows, columns = min(grid_size, height), min(grid_size, width)
+    row_sizes = [(i + 1) * height // rows - i * height // rows for i in range(rows)]
+    col_sizes = [(i + 1) * width // columns - i * width // columns for i in range(columns)]
+
+    def pool(value):
+        row_means = torch.stack([part.mean(-2) for part in
+                                 torch.split(value, row_sizes, dim=-2)], dim=-2)
+        return torch.stack([part.mean(-1) for part in
+                            torch.split(row_means, col_sizes, dim=-1)], dim=-1)
+
+    target, mask = target.detach(), mask.detach().to(prediction)
+    total, count = prediction.new_zeros(len(prediction)), prediction.new_zeros(len(prediction))
+    for weights in (mask, 1 - mask):
+        mass = pool(weights)
+        valid_cells = mass > 0
+        pred_mean = pool(prediction * weights) / mass.clamp_min(1e-8)
+        gt_mean = pool(target * weights) / mass.clamp_min(1e-8)
+        error = (pred_mean - gt_mean).square().mean(1, keepdim=True)
+        per_image = (error * valid_cells).sum((1, 2, 3)) / valid_cells.sum((1, 2, 3)).clamp_min(1)
+        valid_region = ((weights.mean((1, 2, 3)) >= min_area) &
+                        valid_cells.flatten(1).any(1)).to(prediction)
+        total = total + per_image * valid_region
+        count = count + valid_region
+    return (total / count.clamp_min(1)).mean()
+
+
 @MODELS.register_module()
 class AiLUTDual(AiLUT):
     def __init__(self, local_enabled=True, use_region_condition=True,
@@ -35,7 +64,9 @@ class AiLUTDual(AiLUT):
                  foreground_rgb_weight=.1, background_rgb_weight=.1,
                  foreground_color_weight=.1, background_color_weight=.1,
                  face_color_weight=0., boundary_gradient_weight=0.,
-                 lut_mode='tone_residual', postprocess=None, range_project=None, **kwargs):
+                 lut_mode='tone_residual', postprocess=None, range_project=None,
+                 cnn_condition_dropout=0., global_aux_weight=0., global_aux_grid_size=32,
+                 **kwargs):
         if lut_mode not in ('tone_residual', 'basis'):
             raise ValueError("lut_mode must be 'tone_residual' or 'basis'")
         self.lut_mode = lut_mode
@@ -44,6 +75,19 @@ class AiLUTDual(AiLUT):
         super().__init__(**kwargs)
         self.postprocess_cfg = postprocess_options(postprocess)
         self.range_project_cfg = range_options(range_project)
+        for name, value in (('cnn_condition_dropout', cnn_condition_dropout),
+                            ('global_aux_weight', global_aux_weight)):
+            if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                    not math.isfinite(value) or value < 0):
+                raise ValueError(name + ' must be finite and non-negative')
+        if cnn_condition_dropout >= 1:
+            raise ValueError('cnn_condition_dropout must be less than 1')
+        if (isinstance(global_aux_grid_size, bool) or
+                not isinstance(global_aux_grid_size, int) or global_aux_grid_size < 1):
+            raise ValueError('global_aux_grid_size must be a positive integer')
+        self.cnn_condition_dropout = float(cnn_condition_dropout)
+        self.global_aux_weight = float(global_aux_weight)
+        self.global_aux_grid_size = global_aux_grid_size
         self.global_frozen = self.postprocess_cfg['freeze_global']
         self.local_enabled, self.use_region_condition = bool(local_enabled), bool(use_region_condition)
         if region_samples_size < 1 or not 0 <= region_sample_mix <= 1 or not 0 < region_min_area < .5:
@@ -125,6 +169,10 @@ class AiLUTDual(AiLUT):
                        if foreground_samples is None else checked_mask(foreground_samples, samples, 'foreground_samples'))
         global_stats = self.color_statistics(source_image, samples)
         cnn_code = self.backbone(source)
+        if self.training and self.cnn_condition_dropout:
+            # One shared switch per image for both semantic branches.
+            keep = cnn_code.new_empty((len(cnn_code), 1)).bernoulli_(1 - self.cnn_condition_dropout)
+            cnn_code = cnn_code * keep / (1 - self.cnn_condition_dropout)
         area = source_mask.mean((-1, -2)) if region_area is None else region_area[:, :1].to(imgs)
         if not torch.isfinite(area).all() or (area < 0).any() or (area > 1).any():
             raise ValueError('region_area must be finite in [0,1]')
@@ -239,6 +287,11 @@ class AiLUTDual(AiLUT):
         projection = self.range_project_cfg
         reconstruction = aux['raw_output'] if projection['enabled'] else output
         losses = dict(loss_recons=self.recons_loss(reconstruction, gt))
+        if self.global_aux_weight:
+            global_output = (foreground_mask * aux['global_outputs'][0] +
+                             (1 - foreground_mask) * aux['global_outputs'][1])
+            losses['loss_global_aux'] = self.global_aux_weight * regional_low_frequency_loss(
+                global_output, gt, supervision_mask, self.global_aux_grid_size, self.region_min_area)
         if projection['enabled']:
             raw = aux['raw_output']
             if projection['range_weight']:

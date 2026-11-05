@@ -1,5 +1,6 @@
 """Mask loading and aligned crop/context/region sampling for semantic LUTs."""
 import copy
+import math
 from pathlib import Path
 import random
 
@@ -88,10 +89,56 @@ class LoadSemanticMasks:
         return results
 
 
+class LinearRGBPhotometricAugment:
+    """Mild exposure/WB perturbation before any context, samples or crop."""
+    def __init__(self, probability=.5, exposure_ev=.15, channel_gain=.03,
+                 max_new_clip_fraction=.001, max_attempts=8):
+        for name, value in (('probability', probability), ('exposure_ev', exposure_ev),
+                            ('channel_gain', channel_gain),
+                            ('max_new_clip_fraction', max_new_clip_fraction)):
+            if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                    not math.isfinite(value) or value < 0):
+                raise ValueError(name + ' must be finite and non-negative')
+        if probability > 1 or channel_gain >= 1 or max_new_clip_fraction > 1:
+            raise ValueError('invalid photometric probability, gain or clipping threshold')
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+            raise ValueError('max_attempts must be a positive integer')
+        self.probability, self.exposure_ev = probability, exposure_ev
+        self.channel_gain = channel_gain
+        self.max_new_clip_fraction, self.max_attempts = max_new_clip_fraction, max_attempts
+
+    def __call__(self, image):
+        if random.random() >= self.probability:
+            return image.copy()
+        if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError('photometric augmentation expects uint8 HWC RGB')
+        encoded = image.astype(np.float32) / 255.
+        # Display P3 and sRGB share this transfer curve; no primary conversion.
+        linear = np.where(encoded <= .04045, encoded / 12.92,
+                          ((encoded + .055) / 1.055) ** 2.4)
+        for _ in range(self.max_attempts):
+            exposure = 2. ** random.uniform(-self.exposure_ev, self.exposure_ev)
+            gains = np.array([random.uniform(1 - self.channel_gain, 1 + self.channel_gain)
+                              for _ in range(3)], dtype=np.float32)
+            gains /= np.exp(np.log(gains).mean())
+            proposal = linear * (exposure * gains)
+            # Count pixels acquiring a new clipped channel, excluding existing clipping.
+            new_clip = ((proposal > 1) & (linear < 1)).any(axis=2).mean()
+            if new_clip > self.max_new_clip_fraction:
+                continue
+            proposal = proposal.clip(0, 1)
+            result = np.where(proposal <= .0031308, 12.92 * proposal,
+                              1.055 * proposal ** (1. / 2.4) - .055)
+            return np.rint(result.clip(0, 1) * 255).astype(np.uint8)
+        # Reject repeatedly clipping proposals rather than alter the target.
+        return image.copy()
+
+
 @PIPELINES.register_module()
 class SemanticContextAugment:
     def __init__(self, context_size=256, samples_size=64, region_samples_size=32,
-                 crop_ratio=(.6, 1.), flip_ratio=.5, brightness=.2, saturation=.2):
+                 crop_ratio=(.6, 1.), flip_ratio=.5, brightness=.2, saturation=.2,
+                 photometric=None):
         if context_size < 32 or samples_size < 8 or region_samples_size < 1:
             raise ValueError('invalid context/statistics resolution')
         if not 0 < crop_ratio[0] <= crop_ratio[1] <= 1:
@@ -100,6 +147,8 @@ class SemanticContextAugment:
         self.region_samples_size = int(region_samples_size)
         self.crop_ratio, self.flip_ratio = crop_ratio, float(flip_ratio)
         self.jitter = ColorJitter(brightness=brightness, saturation=saturation)
+        self.photometric = (LinearRGBPhotometricAugment(**photometric)
+                            if photometric is not None else None)
 
     def __call__(self, results):
         if results['lq'].shape != results['gt'].shape:
@@ -108,7 +157,10 @@ class SemanticContextAugment:
         if random.random() < self.flip_ratio:
             for key in ['lq', 'gt'] + mask_keys:
                 results[key] = np.flip(results[key], axis=1).copy()
-        results['lq'] = np.asarray(self.jitter(Image.fromarray(results['lq']))).copy()
+        if self.photometric is None:
+            results['lq'] = np.asarray(self.jitter(Image.fromarray(results['lq']))).copy()
+        else:
+            results['lq'] = self.photometric(results['lq'])
         image, mask = results['lq'], results['foreground_mask']
         height, width = image.shape[:2]
         context = torch.from_numpy(image).permute(2, 0, 1)[None].float() / 255.
@@ -186,7 +238,8 @@ def configure_semantic_pipeline(cfg):
                     samples_size=cfg.model.get('stats_pool_size', 64),
                     region_samples_size=cfg.model.get('region_samples_size', 32),
                     crop_ratio=crop['crop_ratio'], flip_ratio=flip.get('flip_ratio', .5),
-                    brightness=jitter.get('brightness', 0), saturation=jitter.get('saturation', 0)))
+                    brightness=jitter.get('brightness', 0), saturation=jitter.get('saturation', 0),
+                    photometric=copy.deepcopy(cfg.get('photometric_augmentation'))))
             elif kind not in ('Flip', 'RandomColorJitter'):
                 if kind in ('FlexibleRescaleToZeroOne', 'ImageToTensor'):
                     if not inserted:

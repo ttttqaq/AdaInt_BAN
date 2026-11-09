@@ -5,6 +5,8 @@ import numbers
 import torch
 import torch.nn as nn
 
+from .modules import stratified_pixels
+
 
 def display_p3_to_lab(rgb):
     """Encoded RGB NCHW -> CIE Lab with a D65 reference white.
@@ -95,3 +97,56 @@ class P3LabColorLoss(nn.Module):
         loss = ((1. - self.hard_weight) * mean + self.hard_weight * hard).mean() / 100.
         return loss, dict(color_delta_e=mean.detach().mean(),
                           color_delta_e_top=hard.detach().mean())
+
+
+class P3LuminanceCDFLoss(nn.Module):
+    """Match the L* distribution of a paired crop, optionally within each region."""
+
+    def __init__(self, mode, weight, num_thresholds=32, bandwidth=None,
+                 sample_size=64, min_region_samples=16):
+        super().__init__()
+        if mode not in ('whole', 'regional'):
+            raise ValueError("luminance_histogram.mode must be 'whole' or 'regional'")
+        if (isinstance(weight, bool) or not isinstance(weight, numbers.Real) or
+                not math.isfinite(weight) or weight < 0):
+            raise ValueError('luminance_histogram.weight must be finite and nonnegative')
+        for name, value in (('num_thresholds', num_thresholds), ('sample_size', sample_size),
+                            ('min_region_samples', min_region_samples)):
+            if isinstance(value, bool) or not isinstance(value, numbers.Integral) or value < 1:
+                raise ValueError('luminance_histogram.' + name + ' must be a positive integer')
+        if bandwidth is None:
+            bandwidth = 1. / num_thresholds
+        if (isinstance(bandwidth, bool) or not isinstance(bandwidth, numbers.Real) or
+                not math.isfinite(bandwidth) or bandwidth <= 0):
+            raise ValueError('luminance_histogram.bandwidth must be finite and positive')
+        self.mode = mode
+        self.weight = float(weight)
+        self.num_thresholds = num_thresholds
+        self.bandwidth = float(bandwidth)
+        self.sample_size = sample_size
+        self.min_region_samples = min_region_samples
+
+    def _soft_counts(self, image):
+        pixels = stratified_pixels(image, self.sample_size).clamp(0, 1)
+        lightness = display_p3_to_lab(pixels)[:, 0].flatten(1) / 100.
+        thresholds = (torch.arange(self.num_thresholds, device=lightness.device,
+                                   dtype=lightness.dtype) + .5) / self.num_thresholds
+        return ((thresholds - lightness[..., None]) / self.bandwidth).sigmoid()
+
+    def forward(self, prediction, target, supervision_mask):
+        if prediction.shape != target.shape:
+            raise ValueError('luminance histogram supervision requires aligned prediction and GT')
+        # Using the same sample locations and weights on both sides lets us
+        # subtract the soft counts before taking each region's average.
+        difference = self._soft_counts(prediction) - self._soft_counts(target.detach())
+        if self.mode == 'whole':
+            return self.weight * difference.mean(1).abs().mean()
+        foreground = stratified_pixels(supervision_mask.detach(), self.sample_size)
+        foreground = foreground.flatten(2).to(difference)
+        weights = torch.cat((foreground, 1 - foreground), dim=1)
+        mass = weights.sum(-1)
+        valid = mass >= self.min_region_samples
+        error = (weights.bmm(difference) / mass.clamp_min(1)[..., None]).abs().mean(-1)
+        valid_count = valid.sum(-1)
+        per_image = (error * valid).sum(-1) / valid_count.clamp_min(1)
+        return self.weight * per_image.sum() / (valid_count > 0).sum().clamp_min(1)

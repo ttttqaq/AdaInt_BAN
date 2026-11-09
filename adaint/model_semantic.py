@@ -9,7 +9,7 @@ from mmedit.models.registry import MODELS
 from mmedit.utils import get_root_logger
 
 from .model import AiLUT
-from .color import p3_delta_e_map, display_p3_to_lab
+from .color import p3_delta_e_map, display_p3_to_lab, P3LuminanceCDFLoss
 from .modules import stratified_pixels, lut_regularizations
 from .semantic_modules import (checked_mask, masked_per_image, RegionColorStatistics,
                                RegionMapping, DualLocalAffineDecoder)
@@ -66,6 +66,7 @@ class AiLUTDual(AiLUT):
                  face_color_weight=0., boundary_gradient_weight=0.,
                  lut_mode='tone_residual', postprocess=None, range_project=None,
                  cnn_condition_dropout=0., global_aux_weight=0., global_aux_grid_size=32,
+                 luminance_histogram=None,
                  **kwargs):
         if lut_mode not in ('tone_residual', 'basis'):
             raise ValueError("lut_mode must be 'tone_residual' or 'basis'")
@@ -75,6 +76,8 @@ class AiLUTDual(AiLUT):
         super().__init__(**kwargs)
         self.postprocess_cfg = postprocess_options(postprocess)
         self.range_project_cfg = range_options(range_project)
+        self.luminance_histogram = (P3LuminanceCDFLoss(**luminance_histogram)
+                                    if luminance_histogram is not None else None)
         for name, value in (('cnn_condition_dropout', cnn_condition_dropout),
                             ('global_aux_weight', global_aux_weight)):
             if (isinstance(value, bool) or not isinstance(value, (int, float)) or
@@ -287,6 +290,8 @@ class AiLUTDual(AiLUT):
         projection = self.range_project_cfg
         reconstruction = aux['raw_output'] if projection['enabled'] else output
         losses = dict(loss_recons=self.recons_loss(reconstruction, gt))
+        if self.luminance_histogram is not None and self.luminance_histogram.weight:
+            losses['loss_luminance_histogram'] = self.luminance_histogram(output, gt, supervision_mask)
         if self.global_aux_weight:
             global_output = (foreground_mask * aux['global_outputs'][0] +
                              (1 - foreground_mask) * aux['global_outputs'][1])
